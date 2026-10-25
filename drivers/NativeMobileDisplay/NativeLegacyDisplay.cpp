@@ -45,6 +45,7 @@ extern "C" void native_legacy_gpu_fallback_observed(int status);
 extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
 // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
 extern "C" bool native_legacy_set_refresh_properties(void *display);
+extern "C" void pagani_panel_set_power(unsigned);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
@@ -84,20 +85,21 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
     bool vsyncArmed=false;
+    bool displayOn=true;
     bool vsyncWanted() const {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
     // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
     // the last client is removed.
     void armVsync() {
-        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
+        if(!displayOn || !vsyncTimer || vsyncArmed || !vsyncWanted())return;
         vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
         vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
     }
     static void vsyncFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->vsyncTick();}
     void vsyncTick() {
         vsyncArmed=false;
-        if(!vsyncTimer)return;
+        if(!displayOn || !vsyncTimer)return;
         if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
@@ -186,6 +188,16 @@ public:
         if(ordinal>1 || !bootMapping){native_legacy_pm_observed(3,kIOReturnUnsupported,ordinal);return kIOReturnUnsupported;}
         native_legacy_pm_observed(3,kIOReturnSuccess,ordinal);
         IOReturn status=IOMobileFramebufferLegacy::setPowerState(ordinal,device);
+        if(status==kIOReturnSuccess) {
+            pagani_panel_set_power((unsigned)ordinal);
+            if(IOWorkLoop *loop=getWorkLoop())loop->runAction([](OSObject *owner,void *value,void *,void *,void *)->IOReturn {
+                auto self=static_cast<NativeLegacyDisplay *>(owner);
+                self->displayOn=(uintptr_t)value!=0;
+                if(self->displayOn)self->armVsync();
+                else if(self->vsyncTimer){self->vsyncTimer->cancelTimeout();self->vsyncArmed=false;}
+                return kIOReturnSuccess;
+            },this,reinterpret_cast<void *>(ordinal));
+        }
         native_legacy_pm_observed(4,status,ordinal);return status;
     }
     // The explicit offline system-client experiment publishes only the real

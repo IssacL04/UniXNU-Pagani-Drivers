@@ -18,6 +18,9 @@ extern "C" void boot_progress_display_status(const char *,uint64_t);
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" void native_keyevents_static_init(void) __asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp");
 extern "C" IOService *native_legacy_display_allocate(void),*native_keyevents_allocate(void);
+extern "C" void pagani_input_static_init(void) __asm__("__GLOBAL__sub_I_PaganiInput.cpp");
+extern "C" void pagani_panel_static_init(void) __asm__("__GLOBAL__sub_I_PaganiPanel.cpp");
+extern "C" IOService *pagani_input_allocate(bool),*pagani_panel_allocate(void);
 static IOService *pendingDisplay;
 static bool displayInitialized,ephemeralState;
 static uint64_t frames,clients,aksCalls,aksOpens;
@@ -30,6 +33,26 @@ static bool registerClass(void (*initializer)(void)) {
     void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if(!handle)return false;
     initializer();return OSMetaClass::postModLoad(handle)==kIOReturnSuccess;
+}
+static void startPeripheral(IOService *service,const char *label) {
+    IOService *provider=IOService::getResourceService();
+    bool attached=service && provider && service->init() && service->attach(provider);
+    bool started=attached && service->start(provider);
+    progress(label,started);
+    if (!started) {if (attached) service->detach(provider);OSSafeReleaseNULL(service);}
+    // A started peripheral retains its service lifetime until reboot, like the display provider.
+}
+static void startPeripherals(bool hidReady) {
+    if (hidReady && (enabled("pagani-touch") || enabled("pagani-buttons")) && registerClass(pagani_input_static_init)) {
+        if (enabled("pagani-buttons")) startPeripheral(pagani_input_allocate(false),"physical buttons started");
+        if (enabled("pagani-touch")) startPeripheral(pagani_input_allocate(true),"S3910 touch started");
+    }
+    if (enabled("pagani-panel")) {
+        kern_return_t loaded=OSKextLoadKextWithIdentifier("com.apple.driver.AppleARMPlatform");
+        progress("AppleARMPlatform load",(uint32_t)loaded);
+        if (!loaded && registerClass(pagani_panel_static_init))
+            startPeripheral(pagani_panel_allocate(),"DSI panel control started");
+    }
 }
 static bool console(PE_Video &video) {
     return !PE_current_console(&video) && video.v_baseAddr && video.v_width && video.v_height &&
@@ -113,7 +136,7 @@ extern "C" void native_legacy_display_probe(void) {
 extern "C" void native_legacy_display_late_probe(void) {
     progress("key state start enter",0);
     startKeyState();
-    // Original HID services can register now; no synthetic input device or events.
+    // Load original event dispatch before attaching physical HID devices.
     progress("IOHIDFamily load enter",0);
     progress("IOHIDFamily load",(uint32_t)OSKextLoadKextWithIdentifier("com.apple.iokit.IOHIDFamily"));
     progress("IOHIDEventDriver load enter",0);
@@ -122,6 +145,7 @@ extern "C" void native_legacy_display_late_probe(void) {
     OSDictionary *hidMatching=IOService::serviceMatching("IOHIDResource");
     IOService *hidResource=hidMatching?IOService::waitForMatchingService(hidMatching,5000000000ULL):nullptr;
     progress("IOHIDResource ready",hidResource!=nullptr);
+    bool hidReady=hidResource!=nullptr;
     OSSafeReleaseNULL(hidResource);OSSafeReleaseNULL(hidMatching);
     IOService *display=pendingDisplay;
     pendingDisplay=nullptr;
@@ -158,6 +182,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         }
     }
     progress("GOP display started",started);
+    if (started) startPeripherals(hidReady);
     OSSafeReleaseNULL(ranges);OSSafeReleaseNULL(memory);OSSafeReleaseNULL(typeData);
     if(!started) {
         if(attached)display->detach(nub);

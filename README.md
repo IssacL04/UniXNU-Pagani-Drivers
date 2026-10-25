@@ -11,6 +11,8 @@
 | `drivers/PaganiDarwinBoot` | UEFI 到 XNU 的负载与内存交接 |
 | `drivers/NativeUfs` | SM8750 UFS、SMMU/DMA 和根卷读取；物理写入关闭 |
 | `drivers/NativeMobileDisplay` | NativeLegacyDisplay CPU 呈现、软件刷新；没有 SM8750 GPU 加速 |
+| `drivers/PaganiInput` | S3910 LBP 触摸、PMIC 电源／音量键与 HID；模拟测试通过，待完整构建与真机验收 |
+| `drivers/PaganiPanel` | DSI 亮度、显示开关及背光类接入；模拟测试通过，待完整构建与真机验收 |
 | `drivers/NativeAES` | 当前构建使用的 AES 接口，未单独验收硬件功能 |
 | `drivers/NativeVirtioBlock` | 构建与存储依赖，不代表 13T 有可用的 Virtio 硬件 |
 | `drivers/NativeRamBlock` | 临时可写 RAM Data，重启后丢失修改 |
@@ -21,13 +23,13 @@
 | `kits/NativePrelink` | 原版组件预链接、Mach-O 与 ABI 工具 |
 | `kits/PaganiVerifiedRoot` | 根卷策略与校验库 |
 
-这 12 个驱动/诊断目录与 2 个 kit 收录当前构建所需源码，不能据此把所有硬件功能列为已完成。未纳入尚未适配本机的 Adreno、Metal、触摸、网络等模块。第 39 版的真机记录见设备仓库 README 和 STAGE6.md；本次拆仓不改变驱动行为。
+这 14 个驱动／诊断目录与 2 个 kit 收录当前构建所需源码。新增输入与面板实现仍需完整构建和真机验证；未纳入 Adreno、Metal、网络等模块。第 39 版的真机记录见设备仓库 README 和 STAGE6.md。
 
 ## 使用和开发
 
 设备仓库仍以 `modules/Pagani` 一个子模块固定本仓库。格式 2 在主仓 `components.toml` 中登记社区组件的来源、依赖、构建阶段和输出。为区分官方实现，ArmCpu、ArmDTPlatform、DarwinBoot 和 VerifiedRoot 的目录分别改为 PaganiArmCpu、PaganiArmDTPlatform、PaganiDarwinBoot 和 PaganiVerifiedRoot；类名、文件名、bundle ID 和导出符号保持原样。其他社区组件保留现有名称。
 
-SM8750 的 GCC/UFS 寄存器定义和 SMMU 操作由同级 `UniXNU-sm8750-common/kits/Sm8750Platform` 提供。编译器通过构建树的 `kits/` include 路径引用该接口；根分区名称仍由设备构建配置提供。
+SM8750 的 GCC/UFS、SMMU、SPMI 观察通道和 DSI FIFO 操作由同级 `UniXNU-sm8750-common/kits/Sm8750Platform` 提供。编译器通过构建树的 `kits/` include 路径引用该接口；分区策略和外设接线由设备配置提供。
 
 从同级 `UniXNU/` 主仓执行：
 
