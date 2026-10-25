@@ -19,13 +19,13 @@ import time
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--output', required=True, type=Path)
 p.add_argument('--qemu', default='qemu-system-aarch64')
-p.add_argument('--verified-root', type=Path, help='VerifiedRoot checkout (default: umbrella kits/VerifiedRoot)')
+p.add_argument('--verified-root', type=Path, help='VerifiedRoot checkout (default: umbrella kits/PaganiVerifiedRoot)')
 p.add_argument('--openssl-prefix', type=Path, help='OpenSSL 3 prefix (default: brew --prefix openssl@3)')
 a = p.parse_args()
 out = a.output.resolve(); out.mkdir(parents=True, exist_ok=True)
 source = Path(__file__).resolve().parent
 import root_path_fixture
-verified_root = (a.verified_root or source.parents[2] / 'kits/VerifiedRoot').resolve()
+verified_root = (a.verified_root or source.parents[2] / 'kits/PaganiVerifiedRoot').resolve()
 openssl = a.openssl_prefix or Path(subprocess.check_output(['brew','--prefix','openssl@3'],text=True).strip())
 library = root_path_fixture.build_library(source,out,verified_root,openssl)
 fixture = root_path_fixture.prepare(out,verified_root)

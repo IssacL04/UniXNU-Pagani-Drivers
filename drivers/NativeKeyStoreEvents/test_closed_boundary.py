@@ -69,6 +69,7 @@ public:
     (work / "IOKit/IOUserClient.h").write_text("#pragma once\n#include <IOKit/IOService.h>\n")
     (work / "test.cpp").write_text(r'''
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <map>
@@ -87,7 +88,8 @@ extern "C" void native_aks_call(uint32_t, int32_t) { ++calls; }
 static bool decode(const uint8_t *p, size_t n, std::map<std::string, int64_t> &out) {
     size_t i = 0;
     auto len = [&](size_t &l) { if (i >= n) return false; uint8_t b = p[i++]; if (b < 0x80) { l = b; return true; }
-        if (b != 0x81 || i >= n) return false; l = p[i++]; return true; };
+        if (b != 0x81 || i >= n) return false;
+        l = p[i++]; return true; };
     if (n < 2 || p[i++] != 0x31) return false;
     size_t total; if (!len(total) || i + total != n) return false;
     while (i < n) {
