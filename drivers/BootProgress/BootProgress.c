@@ -334,6 +334,26 @@ void boot_progress_touch_spi(uint32_t firmware, uint32_t disabled, uint32_t stat
     irq_restore(flags);
 }
 
+void boot_progress_touch_dma(uint32_t tx, uint32_t rx, uint32_t txin, uint32_t rxin)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+        "SPI DMA tx=%x rx=%x ti=%x ri=%x", tx, rx, txin, rxin);
+    irq_restore(flags);
+}
+
+void boot_progress_touch_smmu(uint32_t slot, uint32_t bank, uint32_t smr, uint32_t s2cr)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) {
+        snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
+            "SMMU slot=%x bank=%x", slot, bank);
+        snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+            "SMMU smr=%x s2cr=%x", smr, s2cr);
+    }
+    irq_restore(flags);
+}
+
 void boot_progress_peripheral_enable(int enabled)
 {
     __atomic_store_n(&peripheral_overlay, enabled != 0, __ATOMIC_RELEASE);

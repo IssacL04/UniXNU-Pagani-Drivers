@@ -8,6 +8,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <libkern/c++/OSString.h>
 #include <kern/clock.h>
+#include <SmmuTakeover.h>
 extern "C" {
 #include "S3910.h"
 #include <GeniSpi.h>
@@ -16,12 +17,28 @@ extern "C" {
 #include "Reports.h"
 #include "../BootProgress/PeripheralStatus.h"
 
+static void dmaCache(void *bytes,size_t size,unsigned operation) {
+    uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t line=4ULL<<((ctr>>16)&15),end=(uintptr_t)bytes+size;
+    for (uintptr_t at=(uintptr_t)bytes&~(line-1);at<end;at+=line) {
+        if (operation==0) __asm__ volatile("dc cvac, %0" :: "r"(at) : "memory");
+        else if (operation==1) __asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
+        else __asm__ volatile("dc ivac, %0" :: "r"(at) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+static void dmaClean(void *,void *p,size_t n) {dmaCache(p,n,0);}
+static void dmaCleanInval(void *,void *p,size_t n) {dmaCache(p,n,1);}
+static void dmaInval(void *,void *p,size_t n) {dmaCache(p,n,2);}
+
 class PaganiInput : public IOHIDDevice {
     OSDeclareDefaultStructors(PaganiInput)
     IOWorkLoop *loop=nullptr;
     IOTimerEventSource *timer=nullptr;
     bool touch=false,running=false,timerAdded=false;
-    PeripheralWindow core,cnfg,obs,gcc,se,wrapper,pins[6];
+    PeripheralWindow core,cnfg,obs,gcc,se,wrapper,smmu,pins[6];
+    IOBufferMemoryDescriptor *dmaMemory=nullptr;
+    bool dmaExposed=false;
     geni_spi spi={};
     s3910 controller={};
     s3910_frame previous={};
@@ -46,10 +63,13 @@ class PaganiInput : public IOHIDDevice {
     }
     int transferTouch(const uint8_t *tx,uint8_t *rx,size_t size) {
         spi.snap_valid=0;
+        if (spi.use_dma) dmaExposed=true;
         int rc=geni_spi_transfer(&spi,tx,rx,size,0);
         // Preserve the driver's pre-cancel snapshot; live registers now describe recovery.
         if (rc && spi.snap_valid) boot_progress_touch_spi(spi.info.fw_revision,spi.info.if_disable,
             spi.snap_status,spi.snap_irq,spi.snap_txfs,spi.snap_rxfs);
+        if (rc && spi.snap_valid && spi.use_dma) boot_progress_touch_dma(
+            spi.snap_dma_tx,spi.snap_dma_rx,spi.snap_dma_txin,spi.snap_dma_rxin);
         return rc;
     }
     static int readTouch(void *ctx,uint8_t *data,size_t size) {
@@ -64,6 +84,37 @@ class PaganiInput : public IOHIDDevice {
         return static_cast<PaganiInput *>(ctx)->transferTouch(data,nullptr,size);
     }
     static void sleepTouch(void *,unsigned ms) {IOSleep(ms);}
+    int setupDma() {
+        constexpr size_t bytes=4096;
+        static_assert(S3910_PAYLOAD_MAX+7<=bytes,"touch transfer fits DMA page");
+        observe("DMA allocate");
+        dmaMemory=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+            static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous)|
+            static_cast<IOOptionBits>(kIOMemoryMapperNone),2*bytes,bytes);
+        if (!dmaMemory) return -12;
+        IOByteCount contiguous=0;
+        uint64_t physical=dmaMemory->getPhysicalSegment(0,&contiguous,kIOMemoryMapperNone);
+        auto virt=static_cast<uint8_t *>(dmaMemory->getBytesNoCopy());
+        if (!virt || !physical || (physical&(bytes-1)) || contiguous<2*bytes) return -14;
+        memset(virt,0,2*bytes);dmaCache(virt,2*bytes,1);
+        observe("SMMU map");
+        if (!smmu.map(PAGANI_TOUCH_SMMU,PAGANI_TOUCH_SMMU_SIZE)) return -12;
+        auto read=[this](unsigned at) {return PeripheralWindow::read(&smmu,at);};
+        auto write=[this](unsigned at,uint32_t value) {PeripheralWindow::write(&smmu,at,value);};
+        // Refuse an existing translated/shared QUP stream; do not alter firmware bank 0.
+        auto plan=planUfsSmmu(PAGANI_TOUCH_SMMU_SID,physical,2*bytes,read,PAGANI_TOUCH_SMMU_SIZE);
+        sample=(plan.slot<<16)|plan.bank;observe(plan.error?"SMMU conflict":"SMMU configure");
+        const char *error=configureUfsSmmu(plan,PAGANI_TOUCH_SMMU_SID,read,write);
+        if (error) {
+            IOLog("Pagani touch SMMU: %s slot=%u smr=%x s2cr=%x\n",error,plan.slot,plan.smr,plan.s2cr);
+            boot_progress_touch_smmu(plan.slot,plan.bank,plan.smr,plan.s2cr);return -16;
+        }
+        observe("SMMU sync");unsigned polls=0;
+        if (!syncUfsSmmu(read,write,[&] {IODelay(10);return ++polls>=10000;},sample)) return -110;
+        spi.use_dma=1;
+        spi.dma={nullptr,dmaClean,dmaCleanInval,dmaInval,virt,virt+bytes,physical,physical+bytes,bytes};
+        return 0;
+    }
     int setupButtons() {
         observe("SPMI map");
         if (!core.map(PAGANI_SPMI_CORE,0x3000) || !cnfg.map(PAGANI_SPMI_CNFG,0x4000) || !obs.map(PAGANI_SPMI_OBS,0x80000)) return -12;
@@ -100,8 +151,14 @@ class PaganiInput : public IOHIDDevice {
         // shortcut: adopt boot firmware rails and SPI microcode; cold power-up needs RPMh rail votes.
         observe("GENI firmware");rc=geni_spi_read_info(&spi);if (rc) return rc;
         sample=spi.info.geni_status;
-        if (spi.info.geni_status&GENI_STATUS_M_ACTIVE) return -16;
-        spi.poll_only=1;spi.poll_limit=20000;spi.allow_fifo_disabled=1;
+        if (spi.info.protocol!=GENI_PROTO_SPI) return GENI_ERR_PROTO;
+        if (spi.info.geni_status&(GENI_STATUS_M_ACTIVE|(1u<<12))) return -16;
+        spi.poll_only=1;spi.poll_limit=20000;
+        if (spi.info.fifo_disabled) {
+            rc=setupDma();if (rc) return rc;
+            // ArmCpu masks unused SPIs at distributor init; retain SE status generation for polling.
+            spi.poll_only=2;
+        }
         observe("SPI init");rc=geni_spi_init(&spi);if (rc) return rc;
         observe("SPI mode");rc=geni_spi_setup(&spi,0,0);if (rc) return rc;
         observe("SPI rate");rc=geni_spi_set_clock(&spi,PAGANI_TOUCH_HZ,hz,select);if (rc) return rc;
@@ -180,7 +237,11 @@ class PaganiInput : public IOHIDDevice {
             PeripheralWindow::write(&pins[i],0,savedPins[i]);
         }
         pinsConfigured=0;for (auto &pin:pins) pin.release();
-        core.release();cnfg.release();obs.release();se.release();wrapper.release();gcc.release();
+        if (se.base && spi.use_dma) PeripheralWindow::write(&se,SE_IRQ_EN,0);
+        // shortcut: retain the exposed 8 KiB until reboot; DMA reset completion is not yet qualified on this board.
+        if (dmaExposed) dmaMemory=nullptr;
+        OSSafeReleaseNULL(dmaMemory);
+        core.release();cnfg.release();obs.release();se.release();wrapper.release();gcc.release();smmu.release();
     }
 public:
     void selectTouch() {touch=true;}

@@ -12,9 +12,13 @@
 #include <PeripheralIO.h>
 #include "../../BootProgress/PeripheralStatus.h"
 
-static unsigned spiReads,spiWrites,spiSnapshots;
+static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots;
 static int spiResult;
 static uint32_t spiSnapshot[6];
+static uint32_t dmaSnapshot[4];
+void boot_progress_touch_dma(uint32_t tx,uint32_t rx,uint32_t txin,uint32_t rxin) {
+    const uint32_t values[]={tx,rx,txin,rxin};memcpy(dmaSnapshot,values,sizeof values);++dmaSnapshots;
+}
 void boot_progress_touch_spi(uint32_t fw,uint32_t disabled,uint32_t state,uint32_t irq,uint32_t tx,uint32_t rx) {
     const uint32_t values[]={fw,disabled,state,irq,tx,rx};
     memcpy(spiSnapshot,values,sizeof values);++spiSnapshots;
@@ -28,11 +32,13 @@ static int touchTransfer(geni_spi *spi,const uint8_t *tx,uint8_t *rx,size_t size
     if (spiResult) {
         spi->snap_valid=1;spi->snap_status=1;spi->snap_irq=0x40000000;
         spi->snap_txfs=1;spi->snap_rxfs=0;
+        spi->snap_dma_tx=4;spi->snap_dma_rx=0;spi->snap_dma_txin=2;spi->snap_dma_rxin=1;
     }
     return spiResult;
 }
 struct PaganiInput {
     geni_spi spi={};
+    bool dmaExposed=false;
 #define geni_spi_transfer touchTransfer
 #include "PaganiReadTouch.inc"
 #undef geni_spi_transfer
@@ -52,6 +58,12 @@ static void spiRead() {
     assert(spiSnapshots==1);
     assert(PaganiInput::writeTouch(&device,bytes,4)==-110 && spiWrites==1 && spiSnapshots==2);
     spiResult=0;assert(!PaganiInput::readTouch(&device,bytes,4) && !device.spi.snap_valid && spiSnapshots==2);
+    assert(!device.dmaExposed && !dmaSnapshots);
+    device.spi.use_dma=1;
+    assert(!PaganiInput::readTouch(&device,bytes,4) && device.dmaExposed && !dmaSnapshots);
+    spiResult=-5;assert(PaganiInput::readTouch(&device,bytes,4)==-5 && dmaSnapshots==1);
+    const uint32_t expectedDma[]={4,0,2,1};assert(!memcmp(dmaSnapshot,expectedDma,sizeof expectedDma));
+    spiResult=0;
 }
 
 static void descriptor(const uint8_t *bytes,size_t length,bool touch) {

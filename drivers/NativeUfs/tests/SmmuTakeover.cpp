@@ -156,5 +156,31 @@ int main()
   assert(p.error); // Preserve the older platform's mapped extent.
 #endif
   writes.clear(); assert(configure() && writes.empty());
+  // QUP SE DMA supplies its mapped extent explicitly and must leave the UFS bank intact.
+  std::vector<uint32_t> qup(0x100000/4);
+  auto qr=[&](unsigned at) {return qup.at(at/4);};
+  auto qw=[&](unsigned at,uint32_t value) {qup.at(at/4)=value;};
+  qup[0x20/4]=0x40000080;qup[0x24/4]=0x60000053;qup[0x28/4]=0x5111;
+  qup[0x800/4]=0x80000060;qup[0xc00/4]=82;
+  qup[(0x1000+4*82)/4]=0x10000;qup[(0x1800+4*82)/4]=1;
+  assert(planUfsSmmu(0xa3,0x8cb5e9000ULL,8192,qr,0xd0000).error);
+  auto q=planUfsSmmu(0xa3,0x8cb5e9000ULL,8192,qr,0x100000);
+  assert(!q.error && q.bank==81 && q.slot==127);
+  auto beforeQup=qup;
+  assert(!configureUfsSmmu(q,0xa3,qr,qw));
+  for(unsigned at : {(128+81)*4096U,0x1000+4*81U,0x1800+4*81U,0xc00+4*127U,0x800+4*127U})
+    beforeQup.at(at/4)=qup.at(at/4);
+  assert(beforeQup==qup && qr(0xc00)==82);
+  q=planUfsSmmu(0xa3,0x8cb5e9000ULL,8192,qr,0x100000);assert(!q.error && q.reuse);
+  for(unsigned conflict : {0U,1U,2U}) {
+    qup[(0x800+4*127)/4]=0x800000a3;qup[(0xc00+4*127)/4]=81;qup[0x804/4]=0;
+    if(conflict==0) qup[(0xc00+4*127)/4]=0; // Existing firmware bank 0 is not an approved QUP takeover.
+    if(conflict==1) qup[(0x800+4*127)/4]|=0x10000;
+    if(conflict==2) {qup[0x804/4]=0x800000a3;qup[0xc04/4]=81;}
+    q=planUfsSmmu(0xa3,0x8cb5e9000ULL,8192,qr,0x100000);assert(q.error);
+    assert(!__builtin_strcmp(q.error,"conflicting UFS stream mapping") && (q.smr&0xffff)==0xa3);
+    if(conflict==0) assert(q.s2cr==0 && q.slot==127);
+    beforeQup=qup;assert(configureUfsSmmu(q,0xa3,qr,qw) && qup==beforeQup);
+  }
   puts("PASS: SMMU geometry/conflicts, VA64 high-DMA regression, full-range width limits, ordered configuration, reuse/repair and blocked-write refusal");
 }
