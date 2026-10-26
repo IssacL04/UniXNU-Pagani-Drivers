@@ -343,18 +343,19 @@ void boot_progress_peripheral_enable(int enabled)
 void boot_progress_peripheral_frame(void)
 {
     if (!__atomic_load_n(&peripheral_overlay, __ATOMIC_ACQUIRE)) return;
-    char lines[PAGANI_PERIPHERALS][80];
-    uint64_t flags = irq_save();
-    if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
-    for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) copy_line(lines[i], sizeof(lines[i]), peripheral_status[i]);
-    irq_restore(flags);
+    // Keep automatic stack initialization below the compiler's out-of-line bzero threshold.
+    char line[80];
     // Leave the camera cutout and rounded top corners clear.
     for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) {
-        if (!lines[i][0]) continue;
+        uint64_t flags = irq_save();
+        if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
+        copy_line(line, sizeof(line), peripheral_status[i]);
+        irq_restore(flags);
+        if (!line[0]) continue;
         unsigned at = 0;
         for (unsigned x = 0; x + CELL <= width; x += CELL) {
             if (panic_state) return;
-            unsigned char c = lines[i][at];
+            unsigned char c = line[at];
             if (c) at++;
             glyph_pixels(c ? c : ' ', x, (i + 4) * LINE, 0xffffffff);
         }
