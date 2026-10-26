@@ -6,7 +6,7 @@
 #include <string>
 enum class Fault { None, Empty, Type, Tag, Lun, Query, Residual, Underflow,
   Oversize, SenseLength, CheckCondition, Timeout, StuckWithReply, Fatal, Stop, Start, HighBase, Aggregation,
-  UicTimeout, UicResult, UicFatal, ExitTimeout, ExitDelayed, ExitStatus, StillHibern8, AutoHibernate };
+  UicTimeout, UicResult, UicFatal, ExitTimeout, ExitDelayed, ExitStatus, StillHibern8, AutoHibernate, Preempted };
 static Fault fault;
 static std::array<uint8_t,kDmaBytes> device;
 static std::array<uint32_t,256> registers;
@@ -64,7 +64,7 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
       *reinterpret_cast<uint32_t *>(device.data()+8)=0;
       if (fault==Fault::Empty) return 0;
       memcpy(rsp,cmd,32); rsp[0]=cmd[0]+0x20; rsp[1]=0;
-      if (fault==Fault::StuckWithReply) registers[0x58/4]=1;
+      if (fault==Fault::StuckWithReply || fault==Fault::Preempted) registers[0x58/4]=1;
       if (cmd[0]==1) putBe32(rsp+12,0);
       if (cmd[0]==0x16) putBe32(rsp+20,0x11);
       if (fault==Fault::Type) rsp[0]=0x3f;
@@ -87,7 +87,14 @@ static uint64_t io(unsigned op,uint64_t address,uint64_t value,void *bytes)
     if (op==2) { ++releases; memcpy(at,bytes,value); released=true; }
     else memcpy(bytes,at,value);
   }
-  if (op==4) return now++;
+  if (op==4) {
+    if (fault==Fault::Preempted && registers[0x58/4]==1) {
+      now+=1500000;
+      registers[0x58/4]=0;
+      registers[0x20/4]|=1;
+    }
+    return now++;
+  }
   if (op==5) { ++sleeps; now+=value; }
   return 0;
 }
@@ -122,6 +129,12 @@ int main()
   assert(ufs_test_read(0,0xffffffffULL,1,out.data())==0); // Last READ(10) LBA is valid.
   auto oldWrites=writes;
   assert(ufs_test_read(0,0xffffffffULL,2,out.data())==kIOReturnBadArgument && writes==oldWrites);
+  reset(Fault::Preempted); out.fill(0xa5);
+  assert(ufs_test_read(0,1,1,out.data())==0);
+  assert(!gHost.poisoned && gRootDiagnostic.command==1 && gRootDiagnostic.polls==2);
+  assert(gRootDiagnostic.elapsedTicks>gRootDiagnostic.waitTicks);
+  assert(gRootDiagnostic.ocs==0 && gRootDiagnostic.response==0x21000000);
+  assert(std::all_of(out.begin(),out.begin()+4096,[](uint8_t x){return x==0x7b;}));
   for (Fault f: {Fault::Empty,Fault::Type,Fault::Tag,Fault::Lun,Fault::Residual,
                 Fault::Underflow,Fault::Oversize,Fault::SenseLength,Fault::Timeout,Fault::Fatal}) {
     reset(f); out.fill(0xa5);

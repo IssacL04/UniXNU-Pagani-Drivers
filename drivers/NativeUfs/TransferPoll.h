@@ -10,6 +10,7 @@ static constexpr uint32_t kUfsFatalStatus = 0x71880U;
 template <class Port>
 static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
 {
+  bool finalSample = false;
   for (;;) {
     ++state.polls;
     uint32_t doorbell = port.doorbell();
@@ -22,7 +23,9 @@ static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
       // Also allow a completion so fast that software never observes DB=1.
       if (state.ocs != 15) return UfsTransferEnd::Completed;
     }
-    if (port.expired()) return UfsTransferEnd::Timeout;
-    port.delay();
+    if (finalSample) return UfsTransferEnd::Timeout;
+    // Preemption can cross the deadline after a busy sample; sample completion once more.
+    finalSample = port.expired();
+    if (!finalSample) port.delay();
   }
 }

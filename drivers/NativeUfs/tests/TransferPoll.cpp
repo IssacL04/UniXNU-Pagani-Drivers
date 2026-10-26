@@ -20,13 +20,18 @@ struct FakePort {
   void delay() { assert(!expired()); ++index; }
 };
 
+struct PreemptedPort : FakePort {
+  bool expired() { assert(index == 0 && samples.size() == 2); ++index; return true; }
+  void delay() { assert(false); }
+};
+
 int main()
 {
   // Exact IMG_2971 observation must not be treated as a completed command.
   FakePort noAcceptance{{{0, 15, 0}, {0, 15, 0}, {0, 15, 0}}};
   UfsTransferPoll a;
   assert(pollUfsTransfer(noAcceptance, a) == UfsTransferEnd::Timeout);
-  assert(a.polls == 3 && a.ocs == 15 && a.doorbellSeen == 0);
+  assert(a.polls == 4 && a.ocs == 15 && a.doorbellSeen == 0);
 
   FakePort delayed{{{0, 15, 0}, {1, 15, 0}, {0, 15, 0}, {0, 0, 1}}};
   UfsTransferPoll b;
@@ -37,6 +42,23 @@ int main()
   UfsTransferPoll c;
   assert(pollUfsTransfer(immediate, c) == UfsTransferEnd::Completed);
   assert(c.doorbellSeen == 0); // Seeing DB=1 must not be mandatory.
+
+  // The controller completes while software is descheduled after sampling DB=1.
+  PreemptedPort preempted;
+  preempted.samples = {{1, 15, 0}, {0, 0, 1}};
+  UfsTransferPoll resumed;
+  assert(pollUfsTransfer(preempted, resumed) == UfsTransferEnd::Completed);
+  assert(resumed.polls == 2 && resumed.ocs == 0 && resumed.interruptSeen == 1);
+
+  PreemptedPort stillOwned;
+  stillOwned.samples = {{1, 15, 0}, {1, 0, 1}};
+  UfsTransferPoll owned;
+  assert(pollUfsTransfer(stillOwned, owned) == UfsTransferEnd::Timeout && stillOwned.reads == 0);
+
+  PreemptedPort lateFatal;
+  lateFatal.samples = {{1, 15, 0}, {0, 0, 0x20000}};
+  UfsTransferPoll interrupted;
+  assert(pollUfsTransfer(lateFatal, interrupted) == UfsTransferEnd::Fatal && lateFatal.reads == 0);
 
   FakePort failedCommand{{{1, 15, 0}, {0, 4, 1}}};
   UfsTransferPoll d;
@@ -54,5 +76,5 @@ int main()
     assert(pollUfsTransfer(fatal, f) == UfsTransferEnd::Fatal);
     assert(fatal.reads == 0 && f.interruptSeen == mask); // Fatal wins over OCS=0.
   }
-  puts("PASS: unaccepted, delayed, immediate, failed, stuck and fatal UFS completions");
+  puts("PASS: unaccepted, delayed, immediate, preempted, failed, stuck and fatal UFS completions");
 }
