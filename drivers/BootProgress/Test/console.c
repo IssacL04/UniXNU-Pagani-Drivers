@@ -188,8 +188,13 @@ int main(void)
     boot_progress_peripheral(PAGANI_TOUCH, "TouchComm start", -71, 0x1000010, 0);
     boot_progress_peripheral(PAGANI_KEYS, "HID report", 0, 0xc001, 3);
     boot_progress_peripheral(PAGANI_PERIPHERALS, "out of bounds", 0, 0, 0);
+    boot_progress_peripheral(PAGANI_SPI, "reserved for SPI snapshot", 0, 0, 0);
+    assert(!peripheral_status[PAGANI_SPI][0]);
+    boot_progress_touch_spi(0x101,1,1,0x40000000,1,0x80000001);
     assert(strstr(peripheral_status[PAGANI_TOUCH], "r=ffffffb9 v=1000010 n=0"));
     assert(strstr(peripheral_status[PAGANI_KEYS], "n=3"));
+    assert(!strcmp(peripheral_status[PAGANI_SPI], "SPI fw=101 if=1 st=1 irq=40000000"));
+    assert(!strcmp(peripheral_status[PAGANI_SPI_FIFO], "SPI FIFO tx=1 rx=80000001"));
     saved_row=row;saved_column=column;
     boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
@@ -197,10 +202,10 @@ int main(void)
     boot_progress_peripheral_frame();
     assert(display_owned && row==saved_row && column==saved_column);
     assert(!memcmp(snapshot,allocation+GUARD,4*LINE*PITCH*sizeof(uint32_t)));
-    assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,3*LINE*PITCH*sizeof(uint32_t)));
-    assert(!memcmp(snapshot + 7 * LINE * PITCH, allocation + GUARD + 7 * LINE * PITCH,
-                   (H - 7 * LINE) * PITCH * sizeof(uint32_t)));
-    for (unsigned y=4*LINE;y<7*LINE;++y)
+    assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,5*LINE*PITCH*sizeof(uint32_t)));
+    assert(!memcmp(snapshot + 9 * LINE * PITCH, allocation + GUARD + 9 * LINE * PITCH,
+                   (H - 9 * LINE) * PITCH * sizeof(uint32_t)));
+    for (unsigned y=4*LINE;y<9*LINE;++y)
         for (unsigned x=W;x<PITCH;++x) assert(allocation[GUARD+y*PITCH+x]==0x12345678);
     busy=1;memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
     boot_progress_peripheral_frame();
@@ -208,13 +213,15 @@ int main(void)
     boot_progress_peripheral(PAGANI_KEYS,"PMIC sample",0,0x8001,5);
     poll(NULL,NULL);
     assert(!memcmp(snapshot,allocation+GUARD,4*LINE*PITCH*sizeof(uint32_t)));
-    assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,3*LINE*PITCH*sizeof(uint32_t)));
-    assert(!memcmp(snapshot+7*LINE*PITCH,allocation+GUARD+7*LINE*PITCH,(H-7*LINE)*PITCH*sizeof(uint32_t)));
+    assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,5*LINE*PITCH*sizeof(uint32_t)));
+    assert(!memcmp(snapshot+9*LINE*PITCH,allocation+GUARD+9*LINE*PITCH,(H-9*LINE)*PITCH*sizeof(uint32_t)));
     panic_for_test("panic after system display handoff");
     memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
-    boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);boot_progress_peripheral_frame();
+    boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);
+    boot_progress_touch_spi(0,0,0,0,0,0);boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
     assert(strstr(peripheral_status[PAGANI_KEYS],"PMIC sample"));
+    assert(strstr(peripheral_status[PAGANI_SPI_FIFO],"tx=1 rx=80000001"));
     free(snapshot);
     boot_progress_display_failed();
     assert(allocation[GUARD] == 0xffff4040 && !boot_progress_display_handoff());

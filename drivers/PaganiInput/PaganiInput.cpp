@@ -44,16 +44,24 @@ class PaganiInput : public IOHIDDevice {
         snprintf(touchPhase,sizeof touchPhase,"T%u %02x %s",controller.version,controller.command,controller.stage);
         sample=controller.detail;observe(touchPhase,result);
     }
+    int transferTouch(const uint8_t *tx,uint8_t *rx,size_t size) {
+        spi.snap_valid=0;
+        int rc=geni_spi_transfer(&spi,tx,rx,size,0);
+        // Preserve the driver's pre-cancel snapshot; live registers now describe recovery.
+        if (rc && spi.snap_valid) boot_progress_touch_spi(spi.info.fw_revision,spi.info.if_disable,
+            spi.snap_status,spi.snap_irq,spi.snap_txfs,spi.snap_rxfs);
+        return rc;
+    }
     static int readTouch(void *ctx,uint8_t *data,size_t size) {
         uint8_t dummy[S3910_PAYLOAD_MAX+7];
         if (!data || !size) return -22;
         if (size>sizeof dummy) return -90;
         // Synaptics reads clock 0xff on MOSI, as in the stock HBP SPI transport.
         memset(dummy,0xff,size);
-        return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,dummy,data,size,0);
+        return static_cast<PaganiInput *>(ctx)->transferTouch(dummy,data,size);
     }
     static int writeTouch(void *ctx,const uint8_t *data,size_t size) {
-        return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,data,nullptr,size,0);
+        return static_cast<PaganiInput *>(ctx)->transferTouch(data,nullptr,size);
     }
     static void sleepTouch(void *,unsigned ms) {IOSleep(ms);}
     int setupButtons() {

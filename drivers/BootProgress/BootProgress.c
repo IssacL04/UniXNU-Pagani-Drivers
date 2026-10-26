@@ -313,12 +313,24 @@ void boot_progress_display_status(const char *detail, uint64_t value)
 
 void boot_progress_peripheral(unsigned device, const char *stage, int32_t result, uint32_t value, uint64_t reports)
 {
-    if (device >= PAGANI_PERIPHERALS) return;
+    if (device >= PAGANI_SPI) return;
     static const char *names[] = {"KEYS", "TOUCH", "PANEL"};
     uint64_t flags = irq_save();
     if (!panic_state) snprintf(peripheral_status[device], sizeof(peripheral_status[device]),
         "%s %.18s r=%x v=%x n=%llu", names[device], stage ? stage : "?",
         (unsigned)result, value, (unsigned long long)reports);
+    irq_restore(flags);
+}
+
+void boot_progress_touch_spi(uint32_t firmware, uint32_t disabled, uint32_t state, uint32_t irq, uint32_t tx, uint32_t rx)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) {
+        snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
+            "SPI fw=%x if=%x st=%x irq=%x", firmware, disabled, state, irq);
+        snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+            "SPI FIFO tx=%x rx=%x", tx, rx);
+    }
     irq_restore(flags);
 }
 

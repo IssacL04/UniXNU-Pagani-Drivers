@@ -10,13 +10,26 @@
 #include "Reports.h"
 #include <GeniSpi.h>
 #include <PeripheralIO.h>
+#include "../../BootProgress/PeripheralStatus.h"
 
-static unsigned spiReads;
+static unsigned spiReads,spiWrites,spiSnapshots;
 static int spiResult;
-static int touchTransfer(geni_spi *,const uint8_t *tx,uint8_t *rx,size_t size,int keep) {
-    assert(tx && rx && size && !keep);
-    for (size_t i=0;i<size;++i) assert(tx[i]==0xff);
-    memset(rx,0xa5,size);++spiReads;return spiResult;
+static uint32_t spiSnapshot[6];
+void boot_progress_touch_spi(uint32_t fw,uint32_t disabled,uint32_t state,uint32_t irq,uint32_t tx,uint32_t rx) {
+    const uint32_t values[]={fw,disabled,state,irq,tx,rx};
+    memcpy(spiSnapshot,values,sizeof values);++spiSnapshots;
+}
+static int touchTransfer(geni_spi *spi,const uint8_t *tx,uint8_t *rx,size_t size,int keep) {
+    assert(tx && size && !keep && !spi->snap_valid);
+    if (rx) {
+        for (size_t i=0;i<size;++i) assert(tx[i]==0xff);
+        memset(rx,0xa5,size);++spiReads;
+    } else ++spiWrites;
+    if (spiResult) {
+        spi->snap_valid=1;spi->snap_status=1;spi->snap_irq=0x40000000;
+        spi->snap_txfs=1;spi->snap_rxfs=0;
+    }
+    return spiResult;
 }
 struct PaganiInput {
     geni_spi spi={};
@@ -26,12 +39,19 @@ struct PaganiInput {
 };
 static void spiRead() {
     PaganiInput device;uint8_t bytes[S3910_PAYLOAD_MAX+8]={};
+    device.spi.info.fw_revision=0x101;device.spi.info.if_disable=1;
     assert(!PaganiInput::readTouch(&device,bytes,4) && bytes[0]==0xa5 && spiReads==1);
     assert(!PaganiInput::readTouch(&device,bytes,sizeof(bytes)-1) && spiReads==2);
+    assert(!spiSnapshots);
     spiResult=-110;assert(PaganiInput::readTouch(&device,bytes,4)==-110 && spiReads==3);
+    const uint32_t expected[]={0x101,1,1,0x40000000,1,0};
+    assert(spiSnapshots==1 && !memcmp(spiSnapshot,expected,sizeof expected));
     assert(PaganiInput::readTouch(&device,bytes,sizeof bytes)==-90 && spiReads==3);
     assert(PaganiInput::readTouch(&device,nullptr,4)==-22 && spiReads==3);
     assert(PaganiInput::readTouch(&device,bytes,0)==-22 && spiReads==3);
+    assert(spiSnapshots==1);
+    assert(PaganiInput::writeTouch(&device,bytes,4)==-110 && spiWrites==1 && spiSnapshots==2);
+    spiResult=0;assert(!PaganiInput::readTouch(&device,bytes,4) && !device.spi.snap_valid && spiSnapshots==2);
 }
 
 static void descriptor(const uint8_t *bytes,size_t length,bool touch) {
