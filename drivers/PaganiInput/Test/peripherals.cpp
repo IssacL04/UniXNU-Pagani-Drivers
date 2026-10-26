@@ -7,7 +7,32 @@
 #include <vector>
 #include "Buttons.h"
 #include "S3910.h"
+#include "Reports.h"
 #include <PeripheralIO.h>
+
+static void descriptor(const uint8_t *bytes,size_t length,bool touch) {
+    unsigned bits[4]={},id=0,size=0,count=0,page=0,usage=0,depth=0;
+    std::vector<std::pair<unsigned,unsigned>> applications;
+    for (size_t offset=0;offset<length;) {
+        uint8_t tag=bytes[offset++];assert(tag!=0xfe);
+        unsigned n=tag&3;if (n==3) n=4;
+        assert(n<=length-offset);
+        unsigned value=0;for (unsigned i=0;i<n;++i) value|=(unsigned)bytes[offset++]<<(8*i);
+        switch (tag&0xfc) {
+            case 0x04:page=value;break;
+            case 0x08:usage=value;break;
+            case 0x74:size=value;break;
+            case 0x94:count=value;break;
+            case 0x84:id=value;assert(id && id<4);break;
+            case 0x80:assert(id);bits[id]+=size*count;break;
+            case 0xa0:if (!depth) {assert(value==1);applications.emplace_back(page,usage);}++depth;break;
+            case 0xc0:assert(depth);--depth;break;
+        }
+    }
+    assert(!depth && bits[1]==64 && bits[2]==8 && bits[3]==(touch?61*8:0));
+    assert(applications.size()==(touch?2:1) && applications[0]==std::make_pair(1u,6u));
+    if (touch) assert(applications[1]==std::make_pair(13u,4u));
+}
 
 struct Tcm {
     std::vector<std::vector<uint8_t>> reads,writes;
@@ -137,4 +162,7 @@ static void panel() {
     assert(m.regs[0x15c]==0x30006); // No reset while the engine may still own the command.
     m.writes.clear();assert(dsi_panel_command(&io,0x51,1)==-19 && m.writes.empty());
 }
-int main() {touch();buttons();buses();panel();puts("PASS: TouchComm startup/contact lifecycle, button debounce, SPMI/GCC and DSI faults");}
+int main() {
+    descriptor(buttonsDescriptor,sizeof buttonsDescriptor,false);descriptor(touchDescriptor,sizeof touchDescriptor,true);
+    touch();buttons();buses();panel();puts("PASS: HID applications/report sizes, TouchComm contacts, buttons, SPMI/GCC and DSI faults");
+}

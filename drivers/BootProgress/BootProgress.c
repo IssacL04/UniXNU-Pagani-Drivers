@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include "PeripheralStatus.h"
 #ifndef BOOT_PROGRESS_TEST
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/boot.h>
@@ -56,6 +57,8 @@ extern int snprintf(char *, size_t, const char *, ...);
 static char storage_status[96];
 static char timer_status[96];
 static char display_status[96];
+static char peripheral_status[PAGANI_PERIPHERALS][80];
+static int peripheral_overlay;
 
 static void barrier(void)
 {
@@ -152,9 +155,9 @@ static void render_boot_logo(void)
     logo_visible = 1;
 }
 
-static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
+static void glyph_pixels(unsigned char c, unsigned x, unsigned y, uint32_t color)
 {
-    if (((display_owned || (logo_visible && y >= LOG_TOP * LINE)) && !panic_state) || !framebuffer || x + CELL > width || y + LINE > height) return;
+    if (!framebuffer || x + CELL > width || y + LINE > height) return;
     if (c < 32 || c > 126) c = '?';
     uint64_t bits = font[c - 32];
     for (unsigned gy = 0; gy < 12; gy++) {
@@ -167,6 +170,12 @@ static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
             }
         }
     }
+}
+
+static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
+{
+    if ((display_owned || (logo_visible && y >= LOG_TOP * LINE)) && !panic_state) return;
+    glyph_pixels(c, x, y, color);
 }
 
 static void putc_raw(char c)
@@ -302,6 +311,44 @@ void boot_progress_display_status(const char *detail, uint64_t value)
     boot_progress_root("stage7", detail, value);
 }
 
+void boot_progress_peripheral(unsigned device, const char *stage, int32_t result, uint32_t value, uint64_t reports)
+{
+    if (device >= PAGANI_PERIPHERALS) return;
+    static const char *names[] = {"KEYS", "TOUCH", "PANEL"};
+    uint64_t flags = irq_save();
+    if (!panic_state) snprintf(peripheral_status[device], sizeof(peripheral_status[device]),
+        "%s %.18s r=%x v=%x n=%llu", names[device], stage ? stage : "?",
+        (unsigned)result, value, (unsigned long long)reports);
+    irq_restore(flags);
+}
+
+void boot_progress_peripheral_enable(int enabled)
+{
+    __atomic_store_n(&peripheral_overlay, enabled != 0, __ATOMIC_RELEASE);
+}
+
+// Only the opted-in status rows may repaint after console handoff.
+void boot_progress_peripheral_frame(void)
+{
+    if (!__atomic_load_n(&peripheral_overlay, __ATOMIC_ACQUIRE)) return;
+    char lines[PAGANI_PERIPHERALS][80];
+    uint64_t flags = irq_save();
+    if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
+    for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) copy_line(lines[i], sizeof(lines[i]), peripheral_status[i]);
+    irq_restore(flags);
+    for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) {
+        if (!lines[i][0]) continue;
+        unsigned at = 0;
+        for (unsigned x = 0; x + CELL <= width; x += CELL) {
+            if (panic_state) return;
+            unsigned char c = lines[i][at];
+            if (c) at++;
+            glyph_pixels(c ? c : ' ', x, i * LINE, 0xffffffff);
+        }
+    }
+    barrier();
+}
+
 static void panic_halt(void)
 {
     barrier();
@@ -403,6 +450,8 @@ void early_boot_progress_init(boot_args *args)
     display_owned = 0; logo_visible = 0; panic_state = 0; stage_count = 0; root_sequence = 0; fault_valid = 0;
     poll_count = 0; display_value = 0;
     display_stage[0] = 0; exit_stage[0] = 0;
+    peripheral_overlay = 0;
+    for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) peripheral_status[i][0] = 0;
     boot_progress_panic_text[0] = 0;
     framebuffer = 0; column = 0; row = LOG_TOP; busy = 0;
     framebuffer_pa = 0;
@@ -553,6 +602,7 @@ static void poll(void *unused0, void *unused1)
         row = saved_row; column = saved_column; barrier(); busy = 0;
     }
     irq_restore(flags);
+    boot_progress_peripheral_frame();
     uint64_t deadline;
     clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
     thread_call_enter_delayed(poll_call, deadline);

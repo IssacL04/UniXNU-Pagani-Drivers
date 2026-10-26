@@ -10,6 +10,7 @@
 #include <libkern/c++/OSKext.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
+#include "../BootProgress/PeripheralStatus.h"
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" int boot_progress_display_handoff(void);
@@ -34,24 +35,36 @@ static bool registerClass(void (*initializer)(void)) {
     if(!handle)return false;
     initializer();return OSMetaClass::postModLoad(handle)==kIOReturnSuccess;
 }
-static void startPeripheral(IOService *service,const char *label) {
+static void startPeripheral(IOService *service,const char *label,unsigned device) {
     IOService *provider=IOService::getResourceService();
     bool attached=service && provider && service->init() && service->attach(provider);
+    if (!attached) boot_progress_peripheral(device,"service attach",kIOReturnNoResources,0,0);
     bool started=attached && service->start(provider);
     progress(label,started);
     if (!started) {if (attached) service->detach(provider);OSSafeReleaseNULL(service);}
     // A started peripheral retains its service lifetime until reboot, like the display provider.
 }
 static void startPeripherals(bool hidReady) {
-    if (hidReady && (enabled("pagani-touch") || enabled("pagani-buttons")) && registerClass(pagani_input_static_init)) {
-        if (enabled("pagani-buttons")) startPeripheral(pagani_input_allocate(false),"physical buttons started");
-        if (enabled("pagani-touch")) startPeripheral(pagani_input_allocate(true),"S3910 touch started");
+    boot_progress_peripheral_enable(enabled("pagani-peripheral-status"));
+    for (unsigned i=0;i<PAGANI_PERIPHERALS;++i) boot_progress_peripheral(i,"disabled",0,0,0);
+    if (enabled("pagani-touch") || enabled("pagani-buttons")) {
+        bool ready=hidReady && registerClass(pagani_input_static_init);
+        const char *stage=hidReady?"HID class":"HID resource";
+        if (enabled("pagani-buttons")) {
+            boot_progress_peripheral(PAGANI_KEYS,stage,ready?0:kIOReturnNotReady,0,0);
+            if (ready) startPeripheral(pagani_input_allocate(false),"physical buttons started",PAGANI_KEYS);
+        }
+        if (enabled("pagani-touch")) {
+            boot_progress_peripheral(PAGANI_TOUCH,stage,ready?0:kIOReturnNotReady,0,0);
+            if (ready) startPeripheral(pagani_input_allocate(true),"S3910 touch started",PAGANI_TOUCH);
+        }
     }
     if (enabled("pagani-panel")) {
         kern_return_t loaded=OSKextLoadKextWithIdentifier("com.apple.driver.AppleARMPlatform");
         progress("AppleARMPlatform load",(uint32_t)loaded);
-        if (!loaded && registerClass(pagani_panel_static_init))
-            startPeripheral(pagani_panel_allocate(),"DSI panel control started");
+        bool ready=!loaded && registerClass(pagani_panel_static_init);
+        boot_progress_peripheral(PAGANI_PANEL,loaded?"platform load":"panel class",loaded?loaded:(ready?0:kIOReturnNotReady),0,0);
+        if (ready) startPeripheral(pagani_panel_allocate(),"DSI panel control started",PAGANI_PANEL);
     }
 }
 static bool console(PE_Video &video) {
@@ -83,7 +96,10 @@ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t) {
         // A failed first copy must not permanently hide the diagnostic console.
         if(!frames)boot_progress_display_failed();
         progress("display copy failed",(uint32_t)status);
-    } else {++frames;progress("system frame copied",frames);}
+    } else {
+        ++frames;progress("system frame copied",frames);
+        boot_progress_peripheral_frame();
+    }
 }
 void native_legacy_copy_timing_observed(uint64_t,uint64_t) {}
 void native_legacy_retirement_observed(IOService *) {}

@@ -185,8 +185,35 @@ int main(void)
     boot_progress_root("frame ownership", "preserve pixels", 1);
     for (unsigned i = 0; i < 31; i++) poll(NULL, NULL);
     assert(!memcmp(snapshot, allocation + GUARD, PITCH * H * sizeof(uint32_t)));
-    free(snapshot);
+    boot_progress_peripheral(PAGANI_TOUCH, "TouchComm start", -71, 0x1000010, 0);
+    boot_progress_peripheral(PAGANI_KEYS, "HID report", 0, 0xc001, 3);
+    boot_progress_peripheral(PAGANI_PERIPHERALS, "out of bounds", 0, 0, 0);
+    assert(strstr(peripheral_status[PAGANI_TOUCH], "r=ffffffb9 v=1000010 n=0"));
+    assert(strstr(peripheral_status[PAGANI_KEYS], "n=3"));
+    saved_row=row;saved_column=column;
+    boot_progress_peripheral_frame();
+    assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
+    boot_progress_peripheral_enable(1);
+    boot_progress_peripheral_frame();
+    assert(display_owned && row==saved_row && column==saved_column);
+    assert(memcmp(snapshot, allocation + GUARD, 3 * LINE * PITCH * sizeof(uint32_t)));
+    assert(!memcmp(snapshot + 3 * LINE * PITCH, allocation + GUARD + 3 * LINE * PITCH,
+                   (H - 3 * LINE) * PITCH * sizeof(uint32_t)));
+    for (unsigned y=0;y<3*LINE;++y)
+        for (unsigned x=W;x<PITCH;++x) assert(allocation[GUARD+y*PITCH+x]==0x12345678);
+    busy=1;memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
+    boot_progress_peripheral_frame();
+    assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));busy=0;
+    boot_progress_peripheral(PAGANI_KEYS,"PMIC sample",0,0x8001,5);
+    poll(NULL,NULL);
+    assert(memcmp(snapshot,allocation+GUARD,3*LINE*PITCH*sizeof(uint32_t)));
+    assert(!memcmp(snapshot+3*LINE*PITCH,allocation+GUARD+3*LINE*PITCH,(H-3*LINE)*PITCH*sizeof(uint32_t)));
     panic_for_test("panic after system display handoff");
+    memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
+    boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);boot_progress_peripheral_frame();
+    assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
+    assert(strstr(peripheral_status[PAGANI_KEYS],"PMIC sample"));
+    free(snapshot);
     boot_progress_display_failed();
     assert(allocation[GUARD] == 0xffff4040 && !boot_progress_display_handoff());
     early_boot_progress_suspend();

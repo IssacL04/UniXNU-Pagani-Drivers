@@ -13,21 +13,8 @@ extern "C" {
 #include <GeniSpi.h>
 }
 
-// HID layouts follow UniXNU/NativeHidInput (5f3a37c), BSD-2-Clause-Patent.
-static const uint8_t buttonsDescriptor[]={
-    5,1,9,6,0xa1,1,0x85,1,5,7,0x19,0xe0,0x29,0xe7,0x15,0,0x25,1,
-    0x75,1,0x95,8,0x81,2,0x75,8,0x95,1,0x81,3,0x19,0,0x29,0x65,
-    0x15,0,0x25,0x65,0x75,8,0x95,6,0x81,0,
-    0x85,2,5,0x0c,9,0x40,9,0x30,9,0xe9,9,0xea,0x15,0,0x25,1,
-    0x75,1,0x95,4,0x81,2,0x75,4,0x95,1,0x81,3,0xc0
-};
-#define FINGER \
-    9,0x22,0xa1,2,9,0x42,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,9,0x47,0x81,2,0x75,6,0x95,1,0x81,3, \
-    9,0x51,0x75,8,0x95,1,0x15,0,0x25,9,0x81,2,5,1,9,0x30,0x15,0,0x26,0xff,0x7f,0x75,16,0x95,1,0x81,2,9,0x31,0x81,2,5,0x0d,0xc0,
-static const uint8_t touchDescriptor[]={5,0x0d,9,4,0xa1,1,0x85,3,
-    FINGER FINGER FINGER FINGER FINGER FINGER FINGER FINGER FINGER FINGER
-    9,0x54,0x75,8,0x95,1,0x15,0,0x25,10,0x81,2,0xc0};
-#undef FINGER
+#include "Reports.h"
+#include "../BootProgress/PeripheralStatus.h"
 
 class PaganiInput : public IOHIDDevice {
     OSDeclareDefaultStructors(PaganiInput)
@@ -44,6 +31,14 @@ class PaganiInput : public IOHIDDevice {
     uint32_t savedPins[6]={};
     uint32_t savedReset=0;
     unsigned pinsConfigured=0;
+    const char *phase="allocate";
+    uint32_t sample=0;
+    uint64_t reports=0;
+    int touchError=0;
+    void observe(const char *stage,int result=0) {
+        phase=stage;
+        boot_progress_peripheral(touch?PAGANI_TOUCH:PAGANI_KEYS,phase,result,sample,reports);
+    }
     static int readTouch(void *ctx,uint8_t *data,size_t size) {
         return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,nullptr,data,size,0);
     }
@@ -52,36 +47,50 @@ class PaganiInput : public IOHIDDevice {
     }
     static void sleepTouch(void *,unsigned ms) {IOSleep(ms);}
     int setupButtons() {
+        observe("SPMI map");
         if (!core.map(PAGANI_SPMI_CORE,0x3000) || !cnfg.map(PAGANI_SPMI_CNFG,0x4000) || !obs.map(PAGANI_SPMI_OBS,0x80000)) return -12;
         auto c=core.io(),f=cnfg.io();
+        observe("SPMI channels");
         pon=spmi_find(&c,&f,PAGANI_PON_PPID,PAGANI_SPMI_EE);
         gpio=spmi_find(&c,&f,PAGANI_GPIO_PPID,PAGANI_SPMI_EE);
+        sample=((uint32_t)pon<<16)|((uint32_t)gpio&0xffff);
         if (pon<0 || gpio<0) return -19;
         auto o=obs.io();uint8_t subtype=0,type=0,mode=0,enable=0;
-        if (spmi_read8(&o,PAGANI_SPMI_EE,pon,5,&subtype) || subtype!=9 ||
-            spmi_read8(&o,PAGANI_SPMI_EE,gpio,4,&type) || type!=0x10 ||
-            spmi_read8(&o,PAGANI_SPMI_EE,gpio,5,&subtype) || subtype<0x10 || subtype>0x13 ||
-            spmi_read8(&o,PAGANI_SPMI_EE,gpio,0x40,&mode) || (mode&3) ||
-            spmi_read8(&o,PAGANI_SPMI_EE,gpio,0x46,&enable) || !(enable&0x80)) return -19;
+        observe("PON subtype");
+        int rc=spmi_read8(&o,PAGANI_SPMI_EE,pon,5,&subtype);sample=subtype;
+        if (rc || subtype!=9) return rc?rc:-19;
+        observe("GPIO type");rc=spmi_read8(&o,PAGANI_SPMI_EE,gpio,4,&type);sample=type;
+        if (rc || type!=0x10) return rc?rc:-19;
+        observe("GPIO subtype");rc=spmi_read8(&o,PAGANI_SPMI_EE,gpio,5,&subtype);sample=subtype;
+        if (rc || subtype<0x10 || subtype>0x13) return rc?rc:-19;
+        observe("GPIO mode");rc=spmi_read8(&o,PAGANI_SPMI_EE,gpio,0x40,&mode);sample=mode;
+        if (rc || (mode&3)) return rc?rc:-19;
+        observe("GPIO enable");rc=spmi_read8(&o,PAGANI_SPMI_EE,gpio,0x46,&enable);sample=enable;
+        if (rc || !(enable&0x80)) return rc?rc:-19;
         return 0;
     }
     int setupTouch() {
+        observe("GCC map");
         if (!gcc.map(PAGANI_GCC_BASE,0x60000)) return -12;
         auto g=gcc.io();unsigned hz=0,select=0;
+        observe("SPI clock");
         int rc=sm8750_touch_clock(&g,&hz,&select);if (rc) return rc;
+        sample=hz;observe("SPI map");
         if (!se.map(PAGANI_TOUCH_SE,0x4000) || !wrapper.map(PAGANI_TOUCH_WRAPPER,0x1000)) return -12;
         spi.se={&se,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
         spi.wrapper={&wrapper,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
         // shortcut: adopt boot firmware rails and SPI microcode; cold power-up needs RPMh rail votes.
-        rc=geni_spi_read_info(&spi);if (rc) return rc;
+        observe("GENI firmware");rc=geni_spi_read_info(&spi);if (rc) return rc;
+        sample=spi.info.geni_status;
         if (spi.info.geni_status&GENI_STATUS_M_ACTIVE) return -16;
         spi.poll_only=1;spi.poll_limit=20000;spi.allow_fifo_disabled=1;
-        rc=geni_spi_init(&spi);if (rc) return rc;
-        rc=geni_spi_setup(&spi,0,0);if (rc) return rc;
-        rc=geni_spi_set_clock(&spi,PAGANI_TOUCH_HZ,hz,select);if (rc) return rc;
+        observe("SPI init");rc=geni_spi_init(&spi);if (rc) return rc;
+        observe("SPI mode");rc=geni_spi_setup(&spi,0,0);if (rc) return rc;
+        observe("SPI rate");rc=geni_spi_set_clock(&spi,PAGANI_TOUCH_HZ,hz,select);if (rc) return rc;
         const unsigned gpios[]=PAGANI_TOUCH_PINS;
         const unsigned drives[]=PAGANI_TOUCH_DRIVES;
         for (unsigned i=0;i<6;++i) {
+            sample=gpios[i];observe("touch GPIO");
             if (!pins[i].map(PAGANI_TLMM_GPIO(gpios[i]),0x1000)) return -12;
             savedPins[i]=PeripheralWindow::read(&pins[i],0);
             uint32_t cfg=(savedPins[i]&~0x3ffu)|(drives[i]<<6)|(i<4?4:0);
@@ -95,11 +104,15 @@ class PaganiInput : public IOHIDDevice {
         PeripheralWindow::write(&pins[4],4,0);IOSleep(PAGANI_TOUCH_RESET_MS);
         PeripheralWindow::write(&pins[4],4,2);IOSleep(PAGANI_TOUCH_STARTUP_MS);
         controller.bus={this,readTouch,writeTouch,sleepTouch};
-        return s3910_start(&controller);
+        observe("TouchComm start");rc=s3910_start(&controller);
+        sample=((uint32_t)controller.mode<<24)|((uint32_t)controller.code<<16)|controller.length;
+        return rc;
     }
     bool send(const void *bytes,size_t size) {
         auto buffer=IOBufferMemoryDescriptor::withBytes(bytes,size,kIODirectionNone);
         IOReturn rc=buffer?handleReport(buffer,0,0):kIOReturnNoMemory;
+        if (!rc) ++reports;
+        observe("HID report",rc);
         OSSafeReleaseNULL(buffer);return rc==kIOReturnSuccess;
     }
     void releaseContacts() {
@@ -112,23 +125,31 @@ class PaganiInput : public IOHIDDevice {
         auto self=static_cast<PaganiInput *>(owner);
         if (!__atomic_load_n(&self->running,__ATOMIC_ACQUIRE)) return;
         if (self->touch) {
-            if (self->controller.ready && !(PeripheralWindow::read(&self->pins[5],4)&1)) {
+            if (self->controller.ready) self->sample=PeripheralWindow::read(&self->pins[5],4)&1;
+            if (self->controller.ready && !self->sample) {
                 s3910_frame frame={};int rc=s3910_poll(&self->controller,&frame);
                 if (rc==1) {
+                    self->sample=0;for (unsigned i=0;i<S3910_CONTACTS;++i) if (frame.contact[i].active) self->sample|=1u<<i;
                     uint8_t report[62];s3910_hid_report(&frame,&self->previous,report);
                     if (self->send(report,sizeof report)) self->previous=frame;
                 } else if (rc<0) {
-                    self->controller.ready=0;self->setProperty("InputError",(uint32_t)rc,32);
+                    self->controller.ready=0;self->touchError=rc;self->setProperty("InputError",(uint32_t)rc,32);
+                    self->sample=((uint32_t)self->controller.code<<16)|self->controller.length;
+                } else {
+                    self->sample=self->controller.code;self->observe("TouchComm idle");
                 }
             }
-            if (!self->controller.ready) self->releaseContacts();
+            else if (self->controller.ready && !self->reports) self->observe("ATTN wait");
+            if (!self->controller.ready) {self->releaseContacts();self->observe("TouchComm read",self->touchError);}
         } else {
             uint8_t p=0,g=1;auto io=self->obs.io();
             int rc=spmi_read8(&io,PAGANI_SPMI_EE,self->pon,0x10,&p);
             if (!rc) rc=spmi_read8(&io,PAGANI_SPMI_EE,self->gpio,0x10,&g);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
             uint8_t mask=pagani_buttons_filter(&self->filter,!rc,pagani_buttons(p,g),ns/1000000);
+            self->sample=((uint32_t)p<<8)|g;
             if (mask!=self->lastButtons) {uint8_t report[]={2,mask};if (self->send(report,2)) self->lastButtons=mask;}
+            else self->observe("PMIC sample",rc);
         }
         // shortcut: poll the ATTN line and PMIC levels until GIC detach/lifetime support is available.
         self->timer->setTimeoutMS(self->touch?8:16);
@@ -156,15 +177,18 @@ public:
         return *out?kIOReturnSuccess:kIOReturnNoMemory;
     }
     bool start(IOService *provider) override {
-        loop=IOWorkLoop::workLoop();if (!loop) return false;
+        observe("work loop");
+        loop=IOWorkLoop::workLoop();if (!loop) {observe(phase,kIOReturnNoMemory);return false;}
         setProperty("HIDDefaultBehavior",true);setProperty("Built-In",true);
         if (touch) {setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);}
         int rc=touch?setupTouch():setupButtons();
-        if (rc) {IOLog("Pagani %s setup failed: %d\n",touch?"touch":"buttons",rc);cleanup();return false;}
-        if (!IOHIDDevice::start(provider)) {cleanup();return false;}
+        if (rc) {observe(phase,rc);IOLog("Pagani %s %s failed: %d\n",touch?"touch":"buttons",phase,rc);cleanup();return false;}
+        observe("HID start");
+        if (!IOHIDDevice::start(provider)) {observe(phase,kIOReturnError);cleanup();return false;}
         timer=IOTimerEventSource::timerEventSource(this,tick);
         timerAdded=timer && loop->addEventSource(timer)==kIOReturnSuccess;
-        if (!timerAdded) {IOHIDDevice::stop(provider);cleanup();return false;}
+        if (!timerAdded) {observe("timer",kIOReturnNoResources);IOHIDDevice::stop(provider);cleanup();return false;}
+        observe("ready");
         __atomic_store_n(&running,true,__ATOMIC_RELEASE);timer->setTimeoutMS(1);return true;
     }
     void stop(IOService *provider) override {
