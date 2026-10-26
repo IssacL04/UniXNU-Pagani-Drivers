@@ -19,9 +19,12 @@ struct s3910_bus {
 };
 struct s3910 {
     struct s3910_bus bus;
-    uint16_t max_x, max_y, config_size, max_write;
-    uint8_t mode, code, ready, crc;
+    uint16_t max_x, max_y, config_size, max_write, max_read;
+    uint8_t mode, code, ready, crc, version, sequence;
     uint16_t length;
+    uint8_t command;
+    const char *stage;
+    uint32_t detail;
     uint8_t payload[S3910_PAYLOAD_MAX];
 };
 // The S3910 firmware remains on the controller; this path never erases or flashes it.

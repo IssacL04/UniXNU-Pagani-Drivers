@@ -8,7 +8,31 @@
 #include "Buttons.h"
 #include "S3910.h"
 #include "Reports.h"
+#include <GeniSpi.h>
 #include <PeripheralIO.h>
+
+static unsigned spiReads;
+static int spiResult;
+static int touchTransfer(geni_spi *,const uint8_t *tx,uint8_t *rx,size_t size,int keep) {
+    assert(tx && rx && size && !keep);
+    for (size_t i=0;i<size;++i) assert(tx[i]==0xff);
+    memset(rx,0xa5,size);++spiReads;return spiResult;
+}
+struct PaganiInput {
+    geni_spi spi={};
+#define geni_spi_transfer touchTransfer
+#include "PaganiReadTouch.inc"
+#undef geni_spi_transfer
+};
+static void spiRead() {
+    PaganiInput device;uint8_t bytes[S3910_PAYLOAD_MAX+8]={};
+    assert(!PaganiInput::readTouch(&device,bytes,4) && bytes[0]==0xa5 && spiReads==1);
+    assert(!PaganiInput::readTouch(&device,bytes,sizeof(bytes)-1) && spiReads==2);
+    spiResult=-110;assert(PaganiInput::readTouch(&device,bytes,4)==-110 && spiReads==3);
+    assert(PaganiInput::readTouch(&device,bytes,sizeof bytes)==-90 && spiReads==3);
+    assert(PaganiInput::readTouch(&device,nullptr,4)==-22 && spiReads==3);
+    assert(PaganiInput::readTouch(&device,bytes,0)==-22 && spiReads==3);
+}
 
 static void descriptor(const uint8_t *bytes,size_t length,bool touch) {
     unsigned bits[4]={},id=0,size=0,count=0,page=0,usage=0,depth=0;
@@ -63,6 +87,103 @@ struct Tcm {
         message(1,format);if (!corruptReadback) message(1);
     }
 };
+
+// Independent table CRC and fixed IDENTIFY bytes check the production bitwise encoder.
+static uint8_t headerCrc(const uint8_t *p,unsigned bits) {
+    static const uint16_t table[]={0,268,536,788,1072,1340,1576,1828,2144,2412,2680,2932,3152,3420,3656,3908};
+    uint16_t r=0xfc;
+    for (;bits>8;bits-=8) {
+        r^=*p++;
+        r=(uint16_t)((r<<4)^table[(r>>4)&15]);r=(uint16_t)((r<<4)^table[(r>>4)&15]);
+    }
+    unsigned x=*p;
+    while (bits--) {if (x&0x80) r^=0x80;x<<=1;r<<=1;if (r&0x100) r^=12;}
+    return (r>>2)&63;
+}
+static uint16_t packetCrc(const std::vector<uint8_t> &bytes) {
+    uint16_t crc=0xffff;
+    for (auto byte:bytes) {
+        uint16_t x=(crc>>8)^byte;x^=x>>4;
+        crc=(uint16_t)((crc<<8)^(x<<12)^(x<<5)^x);
+    }
+    return crc;
+}
+struct Tcm2 : Tcm {
+    static std::vector<uint8_t> header(uint8_t code,unsigned length) {
+        std::vector<uint8_t> h={code,(uint8_t)length,(uint8_t)(length>>8),0};
+        h[3]=headerCrc(h.data(),26);return h;
+    }
+    void response(uint8_t code,const std::vector<uint8_t> &body={},unsigned cap=64) {
+        reads.push_back(header(code,body.size()));
+        for (size_t off=0;off<body.size();) {
+            size_t n=body.size()-off;if (n>cap-6) n=cap-6;
+            auto packet=header(code,n);packet.insert(packet.end(),body.begin()+off,body.begin()+off+n);
+            uint16_t crc=packetCrc(packet);packet.push_back(crc>>8);packet.push_back(crc);
+            reads.push_back(packet);off+=n;
+        }
+    }
+    void startup(unsigned maxRead=64,unsigned maxWrite=64) {
+        reads.push_back({4,0,0,0x3c});
+        std::vector<uint8_t> id(26),app(38);
+        id[1]=1;id[22]=(uint8_t)maxWrite;id[23]=(uint8_t)(maxWrite>>8);
+        id[24]=(uint8_t)maxRead;id[25]=(uint8_t)(maxRead>>8);response(0x10,id,256);
+        app[12]=16;app[33]=0x4c;app[35]=0xa5;app[36]=10;
+        response(1);response(1,app,maxRead);response(1);response(1);response(1,{2,0},maxRead);
+        for (unsigned off=0;off<16;) {off+=maxWrite-6;response(off<16?7:1);}
+        response(1,{0x18,8,1,6,8,7,8,8,16,9,16,3,0,0,0,0},maxRead);response(1);
+    }
+    void checkPackets() const {
+        for (const auto &p:writes) {
+            assert(p.size()>=4 && !headerCrc(p.data(),32));
+            unsigned length=p[1]+(p[2]<<8);assert(p.size()==length+4+(length?2:0));
+            if (length) assert(!packetCrc(p));
+        }
+    }
+};
+
+static void touchV2() {
+    Tcm2 bus;bus.startup();auto d=bus.device();assert(!s3910_start(&d) && d.ready && d.version==2);
+    assert(d.max_read==64 && d.max_write==64 && bus.next==bus.reads.size());
+    assert(bus.writes[0]==std::vector<uint8_t>({2,0,0,0x19}));bus.checkPackets();
+    s3910_frame frame={};bus.response(0x11,{1,2,1,0,0x26,0,0x52});
+    assert(s3910_poll(&d,&frame)==1 && frame.contact[2].active && bus.writes[bus.writes.size()-2][0]==0x0a);
+    bus.checkPackets();
+    bus.response(0xff);assert(s3910_poll(&d,&frame)==-5 && !strcmp(d.stage,"reply"));
+    Tcm2 chunks;chunks.startup(16,16);auto fragmented=chunks.device();assert(!s3910_start(&fragmented));
+    std::vector<uint8_t> config;bool setting=false;
+    for (const auto &p:chunks.writes) {
+        assert(p.size()<=16);
+        if (p[0]==0x26) setting=true;
+        if (setting && (p[0]==0x26 || p[0]==1)) config.insert(config.end(),p.begin()+4,p.end()-2);
+        if (p[0]==0x25) setting=false;
+    }
+    assert(config==std::vector<uint8_t>({0x18,8,1,6,8,7,8,8,16,9,16,3,0,0,0,0}));chunks.checkPackets();
+    Tcm2 retry;retry.startup();retry.reads.insert(retry.reads.begin()+1,Tcm2::header(8,0));
+    auto repeated=retry.device();assert(!s3910_start(&repeated) && retry.writes[0]==retry.writes[1]);retry.checkPackets();
+    Tcm2 pending;pending.startup();pending.reads.insert(pending.reads.begin()+1,Tcm2::header(7,0));
+    auto delayed=pending.device();assert(!s3910_start(&delayed) && pending.writes[1][0]==0x0a);pending.checkPackets();
+    Tcm2 crc;crc.startup();auto damaged=crc.reads[2];damaged.back()^=1;
+    crc.reads.insert(crc.reads.begin()+2,damaged);auto recovered=crc.device();assert(!s3910_start(&recovered));
+    assert(crc.writes[1][0]==7 && crc.writes[2][0]==8);crc.checkPackets();
+    Tcm2 fail;fail.startup();fail.reads[2]=damaged;fail.reads.insert(fail.reads.begin()+2,4,damaged);
+    auto rejected=fail.device();assert(s3910_start(&rejected)==-74 && !rejected.ready);
+    assert(!strcmp(rejected.stage,"body CRC") && fail.writes.size()==6);
+    Tcm2 badHeader;badHeader.startup();badHeader.reads[1][3]^=1;auto broken=badHeader.device();
+    assert(s3910_start(&broken)==-74 && !strcmp(broken.stage,"header") && badHeader.writes.size()==1);
+    Tcm2 oversized;oversized.reads={{4,0,0,0x3c},Tcm2::header(0x10,513)};auto large=oversized.device();
+    assert(s3910_start(&large)==-90 && oversized.writes.size()==1);
+    Tcm2 raw;raw.startup();Tcm2 queued;queued.response(0x23,std::vector<uint8_t>(518),64);
+    raw.reads.insert(raw.reads.begin()+3,queued.reads.begin(),queued.reads.end());auto drained=raw.device();
+    assert(!s3910_start(&drained) && drained.ready && raw.next==raw.reads.size());raw.checkPackets();
+    for (bool readLimit:{false,true}) {
+        Tcm2 limit;limit.startup();auto &id=limit.reads[2];id.resize(id.size()-2);
+        id[readLimit?28:26]=6;uint16_t crc=packetCrc(id);id.push_back(crc>>8);id.push_back(crc);
+        auto invalid=limit.device();assert(s3910_start(&invalid)==-90 && !invalid.ready);
+        assert(!strcmp(invalid.stage,readLimit?"read limit":"write limit"));
+    }
+    Tcm floating;floating.reads={{0xff,0xff,0xff,0xff}};auto absent=floating.device();
+    assert(s3910_start(&absent)==-71 && !absent.version && floating.writes.empty());
+}
 struct MMIO {
     std::map<uint32_t,uint32_t> regs;
     std::vector<std::pair<uint32_t,uint32_t>> writes;
@@ -87,6 +208,7 @@ static void touch() {
     assert(bus.writes[5].size()==19 && bus.writes[5][0]==0x26);
     Tcm bad;bad.startup(true);auto rejected=bad.device();assert(s3910_start(&rejected)==-71 && !rejected.ready);
     assert(bad.writes.back()[0]==0x25); // No touch enable after an unconfirmed format.
+    assert(rejected.command==0x25 && !strcmp(rejected.stage,"format") && rejected.detail==0x06010800);
     Tcm crc;crc.startup();crc.reads[1][27]=0x34;crc.reads[1][28]=0x12;
     auto cd=crc.device();assert(s3910_start(&cd)==0 && cd.crc);
     assert(crc.writes[1]==std::vector<uint8_t>({0x20,0,0,0x5a,0x4a}));
@@ -97,6 +219,12 @@ static void touch() {
     Tcm oversized;oversized.reads={{0xa5,0x10,1,2}};auto od=oversized.device();
     assert(s3910_start(&od)==-90 && oversized.writes.empty());
     Tcm version;version.reads={{0x10,0,0,0}};auto vd=version.device();assert(s3910_start(&vd)==-71);
+    assert(!strcmp(vd.stage,"header") && vd.detail==0x10 && vd.command==0);
+    Tcm continuation;continuation.startup();continuation.reads[1][1]=4;
+    auto failedBody=continuation.device();assert(s3910_start(&failedBody)==-71);
+    assert(!strcmp(failedBody.stage,"continued") && failedBody.detail==0x010004a5 && continuation.writes.empty());
+    Tcm app;app.startup();app.reads[4][4]=1;auto failedApp=app.device();assert(s3910_start(&failedApp)==-71);
+    assert(failedApp.command==0x20 && !strcmp(failedApp.stage,"app info") && failedApp.detail==1);
     s3910_frame frame={},old={};
     const uint8_t sample[]={3, 2,1,0,0x26,0,0x52, 7,2,0,0x4c,0,0xa5, 9,6,0,0,0,0};
     assert(s3910_decode(sample,sizeof sample,19456,42240,&frame)==0);
@@ -163,6 +291,7 @@ static void panel() {
     m.writes.clear();assert(dsi_panel_command(&io,0x51,1)==-19 && m.writes.empty());
 }
 int main() {
+    spiRead();touchV2();
     descriptor(buttonsDescriptor,sizeof buttonsDescriptor,false);descriptor(touchDescriptor,sizeof touchDescriptor,true);
-    touch();buttons();buses();panel();puts("PASS: HID applications/report sizes, TouchComm contacts, buttons, SPMI/GCC and DSI faults");
+    touch();buttons();buses();panel();puts("PASS: SPI read bytes, TouchComm v1/v2 CRC/retry/fragments/bounds, HID contacts, buttons and MMIO faults");
 }

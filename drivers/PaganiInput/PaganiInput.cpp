@@ -35,12 +35,22 @@ class PaganiInput : public IOHIDDevice {
     uint32_t sample=0;
     uint64_t reports=0;
     int touchError=0;
+    char touchPhase[24]={};
     void observe(const char *stage,int result=0) {
         phase=stage;
         boot_progress_peripheral(touch?PAGANI_TOUCH:PAGANI_KEYS,phase,result,sample,reports);
     }
+    void observeTouch(int result) {
+        snprintf(touchPhase,sizeof touchPhase,"T%u %02x %s",controller.version,controller.command,controller.stage);
+        sample=controller.detail;observe(touchPhase,result);
+    }
     static int readTouch(void *ctx,uint8_t *data,size_t size) {
-        return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,nullptr,data,size,0);
+        uint8_t dummy[S3910_PAYLOAD_MAX+7];
+        if (!data || !size) return -22;
+        if (size>sizeof dummy) return -90;
+        // Synaptics reads clock 0xff on MOSI, as in the stock HBP SPI transport.
+        memset(dummy,0xff,size);
+        return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,dummy,data,size,0);
     }
     static int writeTouch(void *ctx,const uint8_t *data,size_t size) {
         return geni_spi_transfer(&static_cast<PaganiInput *>(ctx)->spi,data,nullptr,size,0);
@@ -105,7 +115,7 @@ class PaganiInput : public IOHIDDevice {
         PeripheralWindow::write(&pins[4],4,2);IOSleep(PAGANI_TOUCH_STARTUP_MS);
         controller.bus={this,readTouch,writeTouch,sleepTouch};
         observe("TouchComm start");rc=s3910_start(&controller);
-        sample=((uint32_t)controller.mode<<24)|((uint32_t)controller.code<<16)|controller.length;
+        observeTouch(rc);
         return rc;
     }
     bool send(const void *bytes,size_t size) {
@@ -134,13 +144,12 @@ class PaganiInput : public IOHIDDevice {
                     if (self->send(report,sizeof report)) self->previous=frame;
                 } else if (rc<0) {
                     self->controller.ready=0;self->touchError=rc;self->setProperty("InputError",(uint32_t)rc,32);
-                    self->sample=((uint32_t)self->controller.code<<16)|self->controller.length;
                 } else {
                     self->sample=self->controller.code;self->observe("TouchComm idle");
                 }
             }
             else if (self->controller.ready && !self->reports) self->observe("ATTN wait");
-            if (!self->controller.ready) {self->releaseContacts();self->observe("TouchComm read",self->touchError);}
+            if (!self->controller.ready) {self->releaseContacts();self->observeTouch(self->touchError);}
         } else {
             uint8_t p=0,g=1;auto io=self->obs.io();
             int rc=spmi_read8(&io,PAGANI_SPMI_EE,self->pon,0x10,&p);

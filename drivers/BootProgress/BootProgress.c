@@ -336,6 +336,7 @@ void boot_progress_peripheral_frame(void)
     if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
     for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) copy_line(lines[i], sizeof(lines[i]), peripheral_status[i]);
     irq_restore(flags);
+    // Leave the camera cutout and rounded top corners clear.
     for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) {
         if (!lines[i][0]) continue;
         unsigned at = 0;
@@ -343,7 +344,7 @@ void boot_progress_peripheral_frame(void)
             if (panic_state) return;
             unsigned char c = lines[i][at];
             if (c) at++;
-            glyph_pixels(c ? c : ' ', x, i * LINE, 0xffffffff);
+            glyph_pixels(c ? c : ' ', x, (i + 4) * LINE, 0xffffffff);
         }
     }
     barrier();
