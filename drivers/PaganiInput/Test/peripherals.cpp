@@ -10,14 +10,16 @@
 #include "Reports.h"
 #include <GeniSpi.h>
 #include <PeripheralIO.h>
+#include <Rpmh.h>
+#include <PaganiPeripherals.h>
 #include "../../BootProgress/PeripheralStatus.h"
 
-static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots,readSnapshots,statusReads;
+static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots,readSnapshots,statusReads,timingReads;
 static int spiResult;
 static uint8_t spiRxByte=0xa5;
 static uint32_t spiSnapshot[6];
 static uint32_t dmaSnapshot[4];
-static uint32_t readSnapshot[7];
+static uint32_t readSnapshot[8];
 struct PeripheralWindow {
     uint32_t values[2]={1,0};unsigned reads=0;
     static uint32_t read(void *ctx,uint32_t reg) {
@@ -25,10 +27,13 @@ struct PeripheralWindow {
         return p.values[p.reads++?1:0];
     }
 };
-static uint32_t spiStatus(void *,uint32_t reg) {assert(reg==SE_GENI_STATUS);++statusReads;return 0x40;}
+static uint32_t spiStatus(void *,uint32_t reg) {
+    if (reg==SM8750_SPI_DELAY_COUNTERS) {++timingReads;return 0xc800;}
+    assert(reg==SE_GENI_STATUS);++statusReads;return 0x40;
+}
 void boot_progress_touch_read(uint32_t length,uint32_t head,uint32_t pins,uint32_t dma,
-                              uint32_t state,uint32_t txin,uint32_t rxin) {
-    const uint32_t values[]={length,head,pins,dma,state,txin,rxin};
+                              uint32_t state,uint32_t txin,uint32_t rxin,uint32_t delay) {
+    const uint32_t values[]={length,head,pins,dma,state,txin,rxin,delay};
     memcpy(readSnapshot,values,sizeof values);++readSnapshots;
 }
 void boot_progress_touch_dma(uint32_t tx,uint32_t rx,uint32_t txin,uint32_t rxin) {
@@ -66,10 +71,10 @@ static void spiRead() {
     PaganiInput device;uint8_t bytes[S3910_PAYLOAD_MAX+8]={};
     device.spi.info.fw_revision=0x101;device.spi.info.if_disable=1;
     assert(!PaganiInput::readTouch(&device,bytes,4) && bytes[0]==0xa5 && spiReads==1);
-    const uint32_t expectedRead[]={4,0xa5a5a5a5,13,0,0x40,0,0};
-    assert(readSnapshots==1 && statusReads==1 && !memcmp(readSnapshot,expectedRead,sizeof expectedRead));
+    const uint32_t expectedRead[]={4,0xa5a5a5a5,13,0,0x40,0,0,0xc800};
+    assert(readSnapshots==1 && statusReads==1 && timingReads==1 && !memcmp(readSnapshot,expectedRead,sizeof expectedRead));
     assert(!PaganiInput::readTouch(&device,bytes,sizeof(bytes)-1) && spiReads==2);
-    assert(readSnapshots==1 && statusReads==1 && device.pins[5].reads==2);
+    assert(readSnapshots==1 && statusReads==1 && timingReads==1 && device.pins[5].reads==2);
     assert(!spiSnapshots);
     spiResult=-110;assert(PaganiInput::readTouch(&device,bytes,4)==-110 && spiReads==3);
     const uint32_t expected[]={0x101,1,1,0x40000000,1,0};
@@ -90,15 +95,15 @@ static void spiRead() {
     PaganiInput zero;zero.spi.use_dma=1;spiRxByte=0;
     s3910 chip={};chip.bus={&zero,PaganiInput::readTouch,PaganiInput::writeTouch,[](void *,unsigned){}};
     assert(s3910_start(&chip)==-71 && !chip.version && !chip.detail && !strcmp(chip.stage,"header"));
-    const uint32_t zeroRead[]={4,0,13,1,0x40,4,4};
+    const uint32_t zeroRead[]={4,0,13,1,0x40,4,4,0xc800};
     assert(readSnapshots==2 && !memcmp(readSnapshot,zeroRead,sizeof zeroRead));
     assert(zero.firstReadCaptured && zero.dmaExposed && !zero.spi.snap_valid);
     spiRxByte=0xa5;
     PaganiInput shortRead;uint8_t byte=0;
     assert(!PaganiInput::readTouch(&shortRead,&byte,1) && readSnapshot[0]==1 && readSnapshot[1]==0xa5);
-    PaganiInput failed;spiResult=-110;unsigned before=statusReads;
+    PaganiInput failed;spiResult=-110;unsigned before=statusReads,timingBefore=timingReads;
     assert(PaganiInput::readTouch(&failed,bytes,4)==-110 && !failed.firstReadCaptured);
-    assert(statusReads==before && failed.pins[5].reads==1 && failed.pins[4].reads==0);
+    assert(statusReads==before && timingReads==timingBefore && failed.pins[5].reads==1 && failed.pins[4].reads==0);
     spiResult=0;
 }
 
@@ -268,6 +273,129 @@ struct MMIO {
     static void delay(void *ctx,unsigned us) {static_cast<MMIO *>(ctx)->waited+=us;}
     peripheral_io io() {return {this,read,write,delay};}
 };
+struct Rsc : MMIO {
+    unsigned major,wait,control,status,enable,msg,stride,pending=~0u;
+    uint32_t ignored=~0u;
+    bool partial=false;
+    explicit Rsc(unsigned version=3):major(version),wait(version==2?0x10:0x20),
+        control(wait+4),status(wait+8),enable(wait+12),msg(version==2?0x30:0x34),stride(version==2?20:24) {
+        regs[0]=version<<16;regs[0x0c]=(3u<<12)|(16u<<27);regs[0xd00]=0x87;
+        for (unsigned i=0;i<3;++i) regs[0xd00+i*0x2a0+status]=1;
+    }
+    static void write(void *ctx,uint32_t reg,uint32_t value) {
+        auto &m=*static_cast<Rsc *>(ctx);m.writes.emplace_back(reg,value);
+        if (reg==m.ignored) return;
+        if (reg==0xd08) {m.regs[0xd04]&=~value;return;}
+        m.regs[reg]=value;
+        for (unsigned i=0;i<3;++i) {
+            unsigned b=0xd00+i*0x2a0;
+            if (reg==b+m.control && (value&(1u<<24))) {
+                assert(value==(1u<<24|1u<<16) && m.regs[b+m.enable]==7 && m.regs[b+m.wait]==7);
+                m.pending=b;m.regs[b+m.status]=0;
+                for (unsigned c=0;c<3;++c) m.regs[b+m.msg+12+c*m.stride]=0;
+            }
+        }
+    }
+    static void delay(void *ctx,unsigned us) {
+        auto &m=*static_cast<Rsc *>(ctx);m.waited+=us;
+        if (m.pending==~0u || !m.complete) return;
+        m.regs[m.pending+m.status]=1;
+        for (unsigned c=0;c<3;++c) m.regs[m.pending+m.msg+12+c*m.stride]=(m.partial && c==2)?0x100:0x10100;
+        m.regs[0xd04]|=1u<<((m.pending-0xd00)/0x2a0);m.pending=~0u;
+    }
+    peripheral_io io() {return {this,read,write,delay};}
+};
+static void dbEntry(MMIO &db,unsigned at,const char *name,uint32_t address) {
+    db.regs[at]=db.regs[at+4]=0;
+    for (unsigned i=0;name[i];++i) db.regs[at+(i/4)*4]|=(uint32_t)(uint8_t)name[i]<<(8*(i%4));
+    db.regs[at+16]=address;
+}
+static MMIO commandDb() {
+    MMIO db;db.regs[4]=0x0c0330db;db.regs[8]=4;db.regs[12]=2u<<16;
+    dbEntry(db,144,"ldob4",0x40800);dbEntry(db,168,"ldob16",0x41900);return db;
+}
+static uint32_t powerSnapshot[7];
+static unsigned powerSnapshots,powerWaited;
+void boot_progress_touch_power(uint32_t address,uint32_t hardware,uint32_t tcs,uint32_t state,
+                               uint32_t cmd0,uint32_t cmd1,uint32_t cmd2) {
+    const uint32_t values[]={address,hardware,tcs,state,cmd0,cmd1,cmd2};
+    memcpy(powerSnapshot,values,sizeof values);++powerSnapshots;
+}
+static Rsc *powerRsc;
+static MMIO *powerDb;
+struct PowerWindow {
+    peripheral_io mapped={};
+    bool map(uint64_t address,unsigned size) {
+        if (address==PAGANI_TOUCH_RSC) {assert(size==PAGANI_TOUCH_RSC_SIZE);mapped=powerRsc->io();}
+        else {assert(address==PAGANI_CMD_DB && size==PAGANI_CMD_DB_SIZE);mapped=powerDb->io();}
+        return true;
+    }
+    peripheral_io io() {return mapped;}
+};
+static void IOSleep(unsigned ms) {powerWaited+=ms;}
+struct PowerHarness {
+    PowerWindow rsc,cmddb;uint32_t sample=0;
+    const char *phase="";
+    void observe(const char *value) {phase=value;}
+#include "PaganiTouchPower.inc"
+};
+static void power() {
+    MMIO db=commandDb();auto d=db.io();uint32_t address=0;
+    assert(!rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,PAGANI_TOUCH_VDD,&address) && address==0x40800);
+    assert(!rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,PAGANI_TOUCH_VCC,&address) && address==0x41900);
+    assert(rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,"L4B",&address)==-19 && db.writes.empty());
+    db.regs[12]=3u<<16;dbEntry(db,192,"ldob4",0x40800);
+    assert(rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,"ldob4",&address)==-71);
+    db.regs[12]=0xffff0000;assert(rpmh_vrm_address(&d,200,"ldob4",&address)==-71);
+    db=commandDb();db.regs[160]=0x30800;assert(rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,"ldob4",&address)==-71);
+    db.regs[4]=0;assert(rpmh_vrm_address(&d,PAGANI_CMD_DB_SIZE,"ldob16",&address)==-19);
+    for (unsigned major: {2u,3u}) {
+        Rsc m(major);auto io=m.io();rpmh_result result={};
+        assert(!sm8750_rpmh_vrm_enable(&io,0x40800,PAGANI_TOUCH_VDD_MV,&result));
+        assert(result.tcs==0 && result.status==1 && result.command[2]==0x10100 && m.regs[0xd00]==0x87);
+        assert(!m.regs[0xd04] && !m.regs[0xd00+m.control] && !m.regs[0xd00+m.enable] && !m.regs[0xd00+m.wait]);
+        for (unsigned i=0;i<3;++i) {
+            unsigned at=0xd00+m.msg+i*m.stride;
+            assert(m.regs[at]==0x10108);
+            assert(m.regs[at+4]==0x40800+(i==0?0:i==1?8:4));
+            assert(m.regs[at+8]==(i==0?1800u:i==1?7u:1u));
+        }
+    }
+    Rsc busy;auto io=busy.io();rpmh_result result={};busy.regs[0xd00+busy.control]=1;
+    assert(!sm8750_rpmh_vrm_enable(&io,0x41900,3100,&result) && result.tcs==1);
+    for (auto [reg,value]:busy.writes) { (void)value;assert(reg<0xd10 || reg>=0xfa0); }
+    for (unsigned i=0;i<3;++i) busy.regs[0xd00+i*0x2a0+busy.control]=1;
+    busy.writes.clear();assert(sm8750_rpmh_vrm_enable(&io,0x41900,3100,&result)==-16 && busy.writes.empty());
+    Rsc unknown(4);io=unknown.io();assert(sm8750_rpmh_vrm_enable(&io,0x41900,3100,&result)==-95 && unknown.writes.empty());
+    Rsc fault;io=fault.io();fault.ignored=0xd00+fault.msg+8;
+    assert(sm8750_rpmh_vrm_enable(&io,0x40800,1800,&result)==-5 && fault.pending==~0u && fault.regs[0xd00]==0x87);
+    for (bool partial: {false,true}) {
+        Rsc stalled;io=stalled.io();stalled.complete=partial;stalled.partial=partial;
+        assert(sm8750_rpmh_vrm_enable(&io,0x40800,1800,&result)==-110 && stalled.waited==2000000);
+        assert(stalled.regs[0xd00+stalled.enable]==7 && stalled.regs[0xd00]==0x86);
+        assert(stalled.regs[0xd00+stalled.control]==(1u<<24|1u<<16));
+    }
+    Rsc mapped;db=commandDb();powerRsc=&mapped;powerDb=&db;PowerHarness device;
+    assert(!device.setupTouchPower() && powerWaited==200 && !powerSnapshots);
+    assert(mapped.regs[0xd00+mapped.msg+4]==0x41900 && mapped.regs[0xd00+mapped.msg+8]==3100);
+    mapped.writes.clear();dbEntry(db,168,"other",0x41900);
+    assert(device.setupTouchPower()==-19 && mapped.writes.empty()); // Validate both resources before enabling either rail.
+    db=commandDb();db.regs[184]=0x40800;
+    assert(device.setupTouchPower()==-71 && mapped.writes.empty()); // Never apply 3.1 V to the 1.8 V resource.
+    db=commandDb();mapped.complete=false;
+    assert(device.setupTouchPower()==-110 && powerSnapshots==1 && powerSnapshot[0]==0x40800);
+    assert(!strcmp(device.phase,"power VDD") && powerWaited==200); // No second rail or reset wait after failure.
+}
+static void spiTiming() {
+    MMIO m;auto io=m.io();uint32_t readback=0;
+    m.regs[0x278]=0xfffff;
+    assert(!sm8750_spi_timing(&io,PAGANI_TOUCH_CS_DELAY,PAGANI_TOUCH_WORD_DELAY,&readback));
+    assert(m.regs[0x278]==0xc800 && readback==0xc800 && m.writes.size()==1);
+    m.writes.clear();assert(sm8750_spi_timing(&io,1024,0,&readback)==-22 && m.writes.empty());
+    assert(sm8750_spi_timing(&io,0,1024,&readback)==-22 && m.writes.empty());
+    io.write=[](void *,uint32_t,uint32_t){};m.regs[0x278]=0;
+    assert(sm8750_spi_timing(&io,50,0,&readback)==-5 && readback==0);
+}
 static void touch() {
     Tcm bus;bus.startup();auto d=bus.device();assert(s3910_start(&d)==0 && d.ready);
     assert(d.max_x==19456 && d.max_y==42240 && bus.next==bus.reads.size());
@@ -361,5 +489,5 @@ static void panel() {
 int main() {
     spiRead();touchV2();
     descriptor(buttonsDescriptor,sizeof buttonsDescriptor,false);descriptor(touchDescriptor,sizeof touchDescriptor,true);
-    touch();buttons();buses();panel();puts("PASS: SPI read bytes, TouchComm v1/v2 CRC/retry/fragments/bounds, HID contacts, buttons and MMIO faults");
+    touch();buttons();buses();panel();power();spiTiming();puts("PASS: SPI read bytes, TouchComm v1/v2 CRC/retry/fragments/bounds, HID contacts, buttons, RPMh ownership/ACK/timeout and SPI timing");
 }

@@ -343,14 +343,27 @@ void boot_progress_touch_dma(uint32_t tx, uint32_t rx, uint32_t txin, uint32_t r
 }
 
 void boot_progress_touch_read(uint32_t length, uint32_t head, uint32_t pins, uint32_t dma,
-                              uint32_t state, uint32_t txin, uint32_t rxin)
+                              uint32_t state, uint32_t txin, uint32_t rxin, uint32_t delay)
 {
     uint64_t flags = irq_save();
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "SPI RX n=%x h=%08x a=%x/%x rst=%x", length, head, pins&1, (pins>>1)&1, (pins>>2)&3);
         snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
-            "SPI dma=%x ti=%x ri=%x st=%x", dma, txin, rxin, state);
+            "SPI dma=%x ti=%x ri=%x st=%x dly=%x", dma, txin, rxin, state, delay);
+    }
+    irq_restore(flags);
+}
+
+void boot_progress_touch_power(uint32_t address, uint32_t hardware, uint32_t tcs, uint32_t state,
+                               uint32_t cmd0, uint32_t cmd1, uint32_t cmd2)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) {
+        snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
+            "PWR a=%x hw=%x t=%x", address, hardware, tcs);
+        snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+            "PWR st=%x c=%x/%x/%x", state, cmd0, cmd1, cmd2);
     }
     irq_restore(flags);
 }

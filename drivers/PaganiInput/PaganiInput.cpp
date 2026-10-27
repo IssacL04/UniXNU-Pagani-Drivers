@@ -9,6 +9,7 @@
 #include <libkern/c++/OSString.h>
 #include <kern/clock.h>
 #include <SmmuTakeover.h>
+#include <Rpmh.h>
 extern "C" {
 #include "S3910.h"
 #include <GeniSpi.h>
@@ -36,7 +37,7 @@ class PaganiInput : public IOHIDDevice {
     IOWorkLoop *loop=nullptr;
     IOTimerEventSource *timer=nullptr;
     bool touch=false,running=false,timerAdded=false;
-    PeripheralWindow core,cnfg,obs,gcc,se,wrapper,smmu,pins[6];
+    PeripheralWindow core,cnfg,obs,gcc,se,wrapper,smmu,rsc,cmddb,pins[6];
     IOBufferMemoryDescriptor *dmaMemory=nullptr;
     bool dmaExposed=false,firstReadCaptured=false;
     geni_spi spi={};
@@ -77,8 +78,9 @@ class PaganiInput : public IOHIDDevice {
             for (size_t i=0;i<size && i<4;++i) head|=(uint32_t)rx[i]<<(8*i);
             pin|=(PeripheralWindow::read(&pins[5],4)&1)<<1;
             pin|=(PeripheralWindow::read(&pins[4],4)&3)<<2;
-            boot_progress_touch_read((uint32_t)size,head,pin,spi.use_dma,
-                spi.se.rd(spi.se.ctx,SE_GENI_STATUS),spi.last_tx_in,spi.last_rx_in);
+            boot_progress_touch_read((uint32_t)size,head,pin,(uint32_t)spi.use_dma,
+                spi.se.rd(spi.se.ctx,SE_GENI_STATUS),spi.last_tx_in,spi.last_rx_in,
+                spi.se.rd(spi.se.ctx,SM8750_SPI_DELAY_COUNTERS));
             firstReadCaptured=true;
         }
         return rc;
@@ -149,6 +151,29 @@ class PaganiInput : public IOHIDDevice {
         if (rc || !(enable&0x80)) return rc?rc:-19;
         return 0;
     }
+    int setupTouchPower() {
+        observe("power map");
+        if (!rsc.map(PAGANI_TOUCH_RSC,PAGANI_TOUCH_RSC_SIZE) ||
+            !cmddb.map(PAGANI_CMD_DB,PAGANI_CMD_DB_SIZE)) return -12;
+        auto db=cmddb.io(),power=rsc.io();uint32_t addresses[2]={};
+        observe("power VDD lookup");
+        int rc=rpmh_vrm_address(&db,PAGANI_CMD_DB_SIZE,PAGANI_TOUCH_VDD,&addresses[0]);if (rc) return rc;
+        observe("power VCC lookup");
+        rc=rpmh_vrm_address(&db,PAGANI_CMD_DB_SIZE,PAGANI_TOUCH_VCC,&addresses[1]);if (rc) return rc;
+        observe("power resource");
+        if (addresses[0]!=PAGANI_TOUCH_VDD_VRM || addresses[1]!=PAGANI_TOUCH_VCC_VRM) return -71;
+        const unsigned millivolts[]={PAGANI_TOUCH_VDD_MV,PAGANI_TOUCH_VCC_MV};
+        for (unsigned i=0;i<2;++i) {
+            sample=addresses[i];observe(i?"power VCC":"power VDD");
+            rpmh_result result={};rc=sm8750_rpmh_vrm_enable(&power,addresses[i],millivolts[i],&result);
+            if (rc) {
+                boot_progress_touch_power(addresses[i],result.hardware,result.tcs,result.status,
+                    result.command[0],result.command[1],result.command[2]);
+                return rc;
+            }
+        }
+        IOSleep(PAGANI_TOUCH_POWER_MS);return 0;
+    }
     int setupTouch() {
         observe("GCC map");
         if (!gcc.map(PAGANI_GCC_BASE,0x60000)) return -12;
@@ -159,7 +184,7 @@ class PaganiInput : public IOHIDDevice {
         if (!se.map(PAGANI_TOUCH_SE,0x4000) || !wrapper.map(PAGANI_TOUCH_WRAPPER,0x1000)) return -12;
         spi.se={&se,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
         spi.wrapper={&wrapper,PeripheralWindow::read,PeripheralWindow::write,PeripheralWindow::delay};
-        // shortcut: adopt boot firmware rails and SPI microcode; cold power-up needs RPMh rail votes.
+        // shortcut: retain boot firmware SPI microcode until cold firmware loading is implemented.
         observe("GENI firmware");rc=geni_spi_read_info(&spi);if (rc) return rc;
         sample=spi.info.geni_status;
         if (spi.info.protocol!=GENI_PROTO_SPI) return GENI_ERR_PROTO;
@@ -173,6 +198,9 @@ class PaganiInput : public IOHIDDevice {
         observe("SPI init");rc=geni_spi_init(&spi);if (rc) return rc;
         observe("SPI mode");rc=geni_spi_setup(&spi,0,0);if (rc) return rc;
         observe("SPI rate");rc=geni_spi_set_clock(&spi,PAGANI_TOUCH_HZ,hz,select);if (rc) return rc;
+        auto serial=se.io();observe("SPI timing");
+        rc=sm8750_spi_timing(&serial,PAGANI_TOUCH_CS_DELAY,PAGANI_TOUCH_WORD_DELAY,&sample);if (rc) return rc;
+        rc=setupTouchPower();if (rc) return rc;
         const unsigned gpios[]=PAGANI_TOUCH_PINS;
         const unsigned drives[]=PAGANI_TOUCH_DRIVES;
         for (unsigned i=0;i<6;++i) {
@@ -253,6 +281,8 @@ class PaganiInput : public IOHIDDevice {
         if (dmaExposed) dmaMemory=nullptr;
         OSSafeReleaseNULL(dmaMemory);
         core.release();cnfg.release();obs.release();se.release();wrapper.release();gcc.release();smmu.release();
+        // Leave shared rail votes enabled; cleanup must not cut power to another consumer.
+        rsc.release();cmddb.release();
     }
 public:
     void selectTouch() {touch=true;}
