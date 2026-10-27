@@ -61,3 +61,5 @@ SM8750 的 GCC/UFS、SMMU、SPMI 观察通道和 DSI FIFO 操作由同级 `UniXN
 | `kits/PaganiVerifiedRoot` | [UniXNU/VerifiedRoot](https://github.com/UniXNU/VerifiedRoot) | `2854c61f6c4dfda870ac3d93e1f03d9181edb041` |
 
 `BootProgress`、`ShengPlatformPower` 和 `Stage7Probe` 来自设备仓库 `69952a9`。本仓库不包含 Apple IPSW、kernelcache、设备 DTB、厂商固件、密钥、磁盘镜像或构建产物。
+
+The SM8750 SMP candidate validates the full MPIDR affinity and uses atomic interrupt counters. BootProgress serializes normal diagnostics after VM setup, skips contended observations and preserves the first panic across CPUs without waiting for a stopped console owner. `pagani-platform-status=1` uses the existing overlay for registered/online CPU counts, per-core timer/IPI masks and RAM/free/available MiB; touch status remains separately opt-in. Host tests cover console contention and first-panic retention. Eight-core operation still needs a device boot.

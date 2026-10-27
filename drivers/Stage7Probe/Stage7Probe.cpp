@@ -46,6 +46,7 @@ static void startPeripheral(IOService *service,const char *label,unsigned device
 }
 static void startPeripherals(bool hidReady) {
     boot_progress_peripheral_enable(enabled("pagani-peripheral-status"));
+    boot_progress_platform_enable(enabled("pagani-platform-status"));
     for (unsigned i=0;i<PAGANI_SPI;++i) boot_progress_peripheral(i,"disabled",0,0,0);
     if (enabled("pagani-touch") || enabled("pagani-buttons")) {
         bool ready=hidReady && registerClass(pagani_input_static_init);

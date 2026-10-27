@@ -530,7 +530,7 @@ void ArmCpu::initCPU (bool boot)
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
     armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
     // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
-    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
+    if ((mpidr & 0xff00ffffffULL) != (affinity & 0xff00ffffffULL)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
     if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
     armcpu_smp_step[logicalId] = 6;
     enableGic ();
@@ -541,7 +541,7 @@ void ArmCpu::initCPU (bool boot)
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
     armcpu_smp_step[logicalId] = 7;
-    armcpu_smp_running = armcpu_smp_running + 1;
+    __atomic_add_fetch (&armcpu_smp_running, 1, __ATOMIC_RELAXED);
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
     if (gSelfIpi) { signalCPU (this); }
@@ -577,20 +577,20 @@ void ArmCpu::interrupt (void)
     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
     if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if ((id & 0xffffff) == 27) {
-      armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
-      armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
+      __atomic_add_fetch (&armcpu_timer_interrupts, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch (&armcpu_core_timer[logicalId & 7], 1, __ATOMIC_RELAXED);
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
     } else if ((id & 0xffffff) == 0) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
-      armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
+      __atomic_add_fetch (&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch (&armcpu_core_sgi[logicalId & 7], 1, __ATOMIC_RELAXED);
       armcpu_irq_phase=4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
-      armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
+      __atomic_add_fetch (&armcpu_ipi_interrupts, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch (&armcpu_core_sgi[logicalId & 7], 1, __ATOMIC_RELAXED);
       armcpu_irq_phase = 4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase = 5;
@@ -606,7 +606,7 @@ void ArmCpu::interrupt (void)
         spi->count = spi->count + 1;
         spi->handler (spi->context);
       } else if (intid >= 32 && gDist != 0) {
-        armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
+        __atomic_add_fetch (&armcpu_spi_unhandled, 1, __ATOMIC_RELAXED);
         armcpu_spi_unhandled_id = intid;
         write32 (gDist, 0x180 + (intid / 32) * 4, 1U << (intid % 32));
       } else {
@@ -627,7 +627,7 @@ void ArmCpu::signalCPU (IOCPU *target)
   uint64_t aff = peer->signalTarget ();
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
-  armcpu_ipi_sent = armcpu_ipi_sent + 1;
+  __atomic_add_fetch (&armcpu_ipi_sent, 1, __ATOMIC_RELAXED);
   if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
   __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
@@ -726,8 +726,12 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
 extern "C" void armcpu_ipi_selftest (uint64_t aff)
 {
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
-  armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
-  if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
+  __atomic_add_fetch (&armcpu_ipi_selftest_sent, 1, __ATOMIC_RELAXED);
+  if (gSpiIpi) {
+    int cpu = ml_get_cpu_number (static_cast<uint32_t> (aff));
+    if (cpu >= 0 && cpu < 8) { spiIpiSend (gDist, static_cast<uint32_t> (cpu)); }
+    return;
+  }
   __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
 

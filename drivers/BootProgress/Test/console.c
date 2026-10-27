@@ -32,6 +32,10 @@ static thread_call_t thread_call_allocate_with_options(void (*fn)(void *, void *
 #define BOOT_LOGO_X 2
 #define BOOT_LOGO_Y -1
 static const unsigned char boot_logo[] = {0,64,128,255,255,128,64,0,0,64,128,255,255,128,64,0};
+static uint64_t test_cpu;
+unsigned processor_count, processor_avail_count;
+unsigned long gPhysSize;
+volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
 #include "../BootProgress.c"
 volatile int native_owner_cache_stage;
 volatile uint64_t native_ufs_block_reads, native_ufs_block_failures;
@@ -56,6 +60,18 @@ int main(void)
                       .memSize = 0x10000000, .Video = { (uintptr_t)(allocation + GUARD), 1, PITCH * 4, W, H, 32 } };
     early_boot_progress_init(&args);
     assert(boot_progress_active() && logo_visible);
+    early_boot_progress_vm_ready();
+    unsigned previous = stage_count;
+    uint64_t held = irq_save();
+    assert(held != UINT64_MAX);
+    test_cpu = 0x10000;
+    boot_progress_stage("contended secondary");
+    assert(stage_count == previous && !boot_progress_display_handoff());
+    test_cpu = 0;
+    irq_restore(held);
+    boot_progress_stage("uncontended boot CPU");
+    assert(stage_count == previous + 1);
+
     unsigned logo_at = GUARD + ((H - BOOT_LOGO_HEIGHT) / 2 + BOOT_LOGO_Y) * PITCH +
                        (W - BOOT_LOGO_WIDTH) / 2 + BOOT_LOGO_X;
     assert(allocation[logo_at] == 0xff000000 && allocation[logo_at + 1] == 0xff404040 &&
@@ -121,9 +137,14 @@ int main(void)
     assert(row == saved_row && column == saved_column && native_ufs_block_reads == 5678);
     boot_progress_kernel_exception(0x96000010, 0xfffffff007345678, 0x12345000);
     assert(fault_valid && fault_esr == 0x96000010 && fault_far == 0x12345000);
+    console_smp = 1; console_lock = 1; // A stopped console owner cannot block panic.
     panic_for_test("Failed to mount %s: %u %llx %%", "root device", 60U, 0x123456789abcdef0ULL);
     assert(panic_state == 1 && busy);
     assert(!strcmp(boot_progress_panic_text, "Failed to mount root device: 60 123456789abcdef0 %"));
+    test_cpu = 0x10000;
+    panic_for_test("second CPU must preserve first panic");
+    assert(!strcmp(boot_progress_panic_text, "Failed to mount root device: 60 123456789abcdef0 %"));
+    test_cpu = 0;
     assert(allocation[GUARD] == 0xffff4040);
     assert(allocation[GUARD + W / 3] == 0xff40ff40);
     assert(allocation[GUARD + 2 * W / 3] == 0xff4080ff);
@@ -230,6 +251,14 @@ int main(void)
     assert(!memcmp(snapshot,allocation+GUARD,4*LINE*PITCH*sizeof(uint32_t)));
     assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,5*LINE*PITCH*sizeof(uint32_t)));
     assert(!memcmp(snapshot+9*LINE*PITCH,allocation+GUARD+9*LINE*PITCH,(H-9*LINE)*PITCH*sizeof(uint32_t)));
+    boot_progress_peripheral_enable(0);
+    boot_progress_platform_enable(1);
+    processor_count = processor_avail_count = 8; gPhysSize = 4UL << 30;
+    for (unsigned cpu=0; cpu<8; cpu++) armcpu_core_timer[cpu] = armcpu_core_sgi[cpu] = 1;
+    memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
+    boot_progress_peripheral_frame();
+    assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,2*LINE*PITCH*sizeof(uint32_t)));
+    assert(!memcmp(snapshot+6*LINE*PITCH,allocation+GUARD+6*LINE*PITCH,(H-6*LINE)*PITCH*sizeof(uint32_t)));
     panic_for_test("panic after system display handoff");
     memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
     boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);

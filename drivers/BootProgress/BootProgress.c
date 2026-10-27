@@ -42,7 +42,9 @@ static unsigned width, height, stride, column, row = 6;
 static uint64_t poll_count;
 static thread_call_t poll_call;
 static int display_owned, logo_visible;
-static int busy; // shortcut: single-core observer, add SMP synchronization before enabling more CPUs.
+static int busy;
+static unsigned console_lock, console_smp;
+static uint64_t panic_cpu;
 enum { SCALE = 3, CELL = 6 * SCALE, LINE = 14 * SCALE, LOG_TOP = 6 };
 enum { HISTORY = 8, STAGE_BYTES = 80 };
 static char stages[HISTORY][STAGE_BYTES], root_stage[STAGE_BYTES], root_detail[192];
@@ -58,7 +60,10 @@ static char storage_status[96];
 static char timer_status[96];
 static char display_status[96];
 static char peripheral_status[PAGANI_PERIPHERALS][80];
-static int peripheral_overlay;
+static int peripheral_overlay, platform_overlay;
+extern unsigned processor_count, processor_avail_count;
+extern unsigned long gPhysSize;
+extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
 
 static void barrier(void)
 {
@@ -67,7 +72,7 @@ static void barrier(void)
 #endif
 }
 
-static uint64_t irq_save(void)
+static uint64_t irq_disable(void)
 {
     uint64_t flags = 0;
 #ifndef BOOT_PROGRESS_TEST
@@ -76,13 +81,48 @@ static uint64_t irq_save(void)
     return flags;
 }
 
-static void irq_restore(uint64_t flags)
+static void irq_enable(uint64_t flags)
 {
 #ifndef BOOT_PROGRESS_TEST
     __asm__ volatile("msr daif, %0" :: "r"(flags) : "memory");
 #else
     (void)flags;
 #endif
+}
+
+static uint64_t console_cpu(void)
+{
+    uint64_t cpu = 0;
+#ifndef BOOT_PROGRESS_TEST
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(cpu));
+#else
+    cpu = test_cpu;
+#endif
+    return (cpu & 0xff00ffffffULL) + 1;
+}
+
+static int panic_other_cpu(void)
+{
+    uint64_t owner = __atomic_load_n(&panic_cpu, __ATOMIC_ACQUIRE);
+    return owner && owner != console_cpu();
+}
+
+// Skip contended diagnostics; a stopped CPU must never block the panic screen.
+static uint64_t irq_save(void)
+{
+    uint64_t flags = irq_disable();
+    if (__atomic_load_n(&panic_cpu, __ATOMIC_ACQUIRE) ||
+        (console_smp && __atomic_exchange_n(&console_lock, 1, __ATOMIC_ACQUIRE))) {
+        irq_enable(flags);
+        return UINT64_MAX;
+    }
+    return flags;
+}
+
+static void irq_restore(uint64_t flags)
+{
+    if (console_smp) __atomic_store_n(&console_lock, 0, __ATOMIC_RELEASE);
+    irq_enable(flags);
 }
 
 static uint64_t frequency(void)
@@ -127,6 +167,7 @@ static int geometry(uintptr_t base, uint64_t w, uint64_t h, uint64_t pitch, uint
 
 static void clear_line(unsigned y)
 {
+    if (panic_other_cpu()) return;
     if ((display_owned || (logo_visible && y >= LOG_TOP * LINE)) && !panic_state) return;
     if (!framebuffer || y + LINE > height) return;
     for (unsigned dy = 0; dy < LINE; dy++) {
@@ -157,6 +198,7 @@ static void render_boot_logo(void)
 
 static void glyph_pixels(unsigned char c, unsigned x, unsigned y, uint32_t color)
 {
+    if (panic_other_cpu()) return;
     if (!framebuffer || x + CELL > width || y + LINE > height) return;
     if (c < 32 || c > 126) c = '?';
     uint64_t bits = font[c - 32];
@@ -180,6 +222,7 @@ static void glyph(unsigned char c, unsigned x, unsigned y, uint32_t color)
 
 static void putc_raw(char c)
 {
+    if (panic_other_cpu()) return;
     if (!framebuffer) return;
     if (panic_state && row >= panic_limit) { panic_clipped = 1; return; }
     if (c == '\t') c = ' ';
@@ -227,10 +270,11 @@ void boot_progress_bind(uintptr_t base, unsigned w, unsigned h, unsigned pitch, 
     if ((column + 1) * CELL > width) column = 0;
 }
 
-// Single-core handoff: stop diagnostic drawing before the first system frame.
+// Stop diagnostic drawing before the first system frame.
 int boot_progress_display_handoff(void)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return 0;
     int ready = framebuffer && !panic_state && !busy;
     if (ready) { display_owned = 1; barrier(); }
     irq_restore(flags);
@@ -240,6 +284,7 @@ int boot_progress_display_handoff(void)
 void boot_progress_display_failed(void)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) display_owned = 0;
     irq_restore(flags);
 }
@@ -249,6 +294,7 @@ int boot_progress_active(void) { return framebuffer != 0; }
 void boot_progress_putc(char c)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!busy && !panic_state) { busy = 1; putc_raw(c); barrier(); busy = 0; }
     irq_restore(flags);
 }
@@ -256,6 +302,7 @@ void boot_progress_putc(char c)
 void boot_progress_stage(const char *s)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!busy && !panic_state) {
         busy = 1;
         record_stage(s);
@@ -274,6 +321,7 @@ void boot_progress_stage(const char *s)
 void boot_progress_root(const char *stage, const char *detail, uint64_t value)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state && !busy) {
         busy = 1;
         copy_line(root_stage, sizeof(root_stage), stage);
@@ -303,6 +351,7 @@ void boot_progress_root(const char *stage, const char *detail, uint64_t value)
 void boot_progress_display_status(const char *detail, uint64_t value)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state && !busy) {
         copy_line(display_stage, sizeof(display_stage), detail);
         display_value = value;
@@ -316,6 +365,7 @@ void boot_progress_peripheral(unsigned device, const char *stage, int32_t result
     if (device >= PAGANI_SPI) return;
     static const char *names[] = {"KEYS", "TOUCH", "PANEL"};
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) snprintf(peripheral_status[device], sizeof(peripheral_status[device]),
         "%s %.18s r=%x v=%x n=%llu", names[device], stage ? stage : "?",
         (unsigned)result, value, (unsigned long long)reports);
@@ -325,6 +375,7 @@ void boot_progress_peripheral(unsigned device, const char *stage, int32_t result
 void boot_progress_touch_spi(uint32_t firmware, uint32_t disabled, uint32_t state, uint32_t irq, uint32_t tx, uint32_t rx)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "SPI fw=%x if=%x st=%x irq=%x", firmware, disabled, state, irq);
@@ -337,6 +388,7 @@ void boot_progress_touch_spi(uint32_t firmware, uint32_t disabled, uint32_t stat
 void boot_progress_touch_dma(uint32_t tx, uint32_t rx, uint32_t txin, uint32_t rxin)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
         "SPI DMA tx=%x rx=%x ti=%x ri=%x", tx, rx, txin, rxin);
     irq_restore(flags);
@@ -346,6 +398,7 @@ void boot_progress_touch_read(uint32_t length, uint32_t head, uint32_t pins, uin
                               uint32_t state, uint32_t txin, uint32_t rxin, uint32_t delay)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "SPI RX n=%x h=%08x a=%x/%x rst=%x", length, head, pins&1, (pins>>1)&1, (pins>>2)&3);
@@ -359,6 +412,7 @@ void boot_progress_touch_power(uint32_t address, uint32_t hardware, uint32_t tcs
                                uint32_t cmd0, uint32_t cmd1, uint32_t cmd2)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "PWR a=%x hw=%x t=%x", address, hardware, tcs);
@@ -372,6 +426,7 @@ void boot_progress_touch_hid(uint32_t binding, uint32_t usage, uint32_t events, 
                              uint32_t edges, uint32_t input, uint64_t output, uint32_t mask)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "HID b=%x use=%x/%x ev=%u/%u e=%u", binding, usage>>16, usage&0xffff, events, digitizers, edges);
@@ -384,6 +439,7 @@ void boot_progress_touch_hid(uint32_t binding, uint32_t usage, uint32_t events, 
 void boot_progress_touch_smmu(uint32_t slot, uint32_t bank, uint32_t smr, uint32_t s2cr)
 {
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state) {
         snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
             "SMMU slot=%x bank=%x", slot, bank);
@@ -398,28 +454,43 @@ void boot_progress_peripheral_enable(int enabled)
     __atomic_store_n(&peripheral_overlay, enabled != 0, __ATOMIC_RELEASE);
 }
 
+void boot_progress_platform_enable(int enabled)
+{
+    __atomic_store_n(&platform_overlay, enabled != 0, __ATOMIC_RELEASE);
+}
+
 // Only the opted-in status rows may repaint after console handoff.
 void boot_progress_peripheral_frame(void)
 {
-    if (!__atomic_load_n(&peripheral_overlay, __ATOMIC_ACQUIRE)) return;
-    // Keep automatic stack initialization below the compiler's out-of-line bzero threshold.
+    int platform = __atomic_load_n(&platform_overlay, __ATOMIC_ACQUIRE);
+    if (!platform && !__atomic_load_n(&peripheral_overlay, __ATOMIC_ACQUIRE)) return;
+    uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
+    if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
     char line[80];
-    // Leave the camera cutout and rounded top corners clear.
-    for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) {
-        uint64_t flags = irq_save();
-        if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
-        copy_line(line, sizeof(line), peripheral_status[i]);
-        irq_restore(flags);
+    for (unsigned i = 0; i < (platform ? 2U : PAGANI_PERIPHERALS); i++) {
+        if (platform && i == 0) {
+            unsigned timer = 0, ipi = 0;
+            for (unsigned cpu = 0; cpu < 8; cpu++) {
+                if (__atomic_load_n(&armcpu_core_timer[cpu], __ATOMIC_RELAXED)) timer |= 1U << cpu;
+                if (__atomic_load_n(&armcpu_core_sgi[cpu], __ATOMIC_RELAXED)) ipi |= 1U << cpu;
+            }
+            snprintf(line, sizeof(line), "CPU reg=%u online=%u T=%02x I=%02x",
+                     processor_count, processor_avail_count, timer, ipi);
+        } else if (platform) {
+            snprintf(line, sizeof(line), "RAM MiB=%lu free=%u avail=%u", gPhysSize >> 20,
+                     vm_page_free_count >> 8, memorystatus_available_pages >> 8);
+        } else copy_line(line, sizeof(line), peripheral_status[i]);
         if (!line[0]) continue;
         unsigned at = 0;
         for (unsigned x = 0; x + CELL <= width; x += CELL) {
-            if (panic_state) return;
+            if (panic_state) { irq_restore(flags); return; }
             unsigned char c = line[at];
             if (c) at++;
             glyph_pixels(c ? c : ' ', x, (i + 4) * LINE, 0xffffffff);
         }
     }
-    barrier();
+    barrier(); irq_restore(flags);
 }
 
 static void panic_halt(void)
@@ -456,7 +527,11 @@ void boot_progress_panic(const char *format, va_list *args, unsigned long caller
                          unsigned reason, uint64_t options)
 {
     if (!framebuffer) return;
-    uint64_t flags = irq_save();
+    uint64_t flags = irq_disable();
+    uint64_t owner = 0, cpu = console_cpu();
+    if (!__atomic_compare_exchange_n(&panic_cpu, &owner, cpu, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && owner != cpu) {
+        panic_halt(); return;
+    }
     if (panic_state) {
         panic_footer("NESTED PANIC: first message preserved"); panic_halt(); return;
     }
@@ -516,6 +591,7 @@ void boot_progress_panic(const char *format, va_list *args, unsigned long caller
 // No kernel services, stack protector, SIMD, or relocated pointers on this path.
 void early_boot_progress_init(boot_args *args)
 {
+    console_smp = 0; console_lock = 0; panic_cpu = 0;
     early_boot_args_pa = (uintptr_t)args;
     early_boot_phys_base = args->physBase;
     early_boot_virt_base = args->virtBase;
@@ -523,7 +599,7 @@ void early_boot_progress_init(boot_args *args)
     display_owned = 0; logo_visible = 0; panic_state = 0; stage_count = 0; root_sequence = 0; fault_valid = 0;
     poll_count = 0; display_value = 0;
     display_stage[0] = 0; exit_stage[0] = 0;
-    peripheral_overlay = 0;
+    peripheral_overlay = 0; platform_overlay = 0;
     for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) peripheral_status[i][0] = 0;
     boot_progress_panic_text[0] = 0;
     framebuffer = 0; column = 0; row = LOG_TOP; busy = 0;
@@ -586,6 +662,7 @@ void early_boot_progress_vm_ready(void)
     uintptr_t mapped = framebuffer_pa ? ml_io_map_wcomb(framebuffer_pa, (uint64_t)stride * 4 * height) : 0;
     if (mapped) framebuffer = mapped;
     early_boot_progress_vectors_done();
+    console_smp = 1;
     early_boot_stage = 6;
     boot_progress_stage("S6: kernel VM and exception vectors ready");
 }
@@ -612,7 +689,9 @@ void early_boot_progress_fatal(boot_args *args, uint64_t esr, uint64_t elr, uint
 
 void boot_progress_kernel_exception(uint64_t esr, uint64_t elr, uint64_t far)
 {
-    uint64_t flags = irq_save();
+    if (panic_other_cpu()) { panic_halt(); return; }
+    uint64_t flags = panic_state ? irq_disable() : irq_save();
+    if (flags == UINT64_MAX) return;
     if (panic_state) {
         panic_limit = height / LINE;
         row = panic_limit - 2; column = 0; clear_line(row * LINE); clear_line((row + 1) * LINE);
@@ -624,7 +703,8 @@ void boot_progress_kernel_exception(uint64_t esr, uint64_t elr, uint64_t far)
 #ifndef BOOT_PROGRESS_TEST
     __asm__ volatile("mrs %0, spsr_el1" : "=r"(fault_psr));
 #endif
-    boot_progress_stage("kernel exception");
+    record_stage("kernel exception");
+    text_raw("[XNU] kernel exception\n");
     value_raw("ESR_EL1", esr); value_raw("ELR_EL1", elr); value_raw("FAR_EL1", far);
     barrier(); irq_restore(flags);
 }
@@ -634,6 +714,7 @@ static void poll(void *unused0, void *unused1)
     (void)unused0; (void)unused1;
     if (panic_state) return;
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) goto schedule;
     if (framebuffer && !busy) {
         busy = 1;
         ++poll_count;
@@ -676,6 +757,7 @@ static void poll(void *unused0, void *unused1)
     }
     irq_restore(flags);
     boot_progress_peripheral_frame();
+schedule:;
     uint64_t deadline;
     clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
     thread_call_enter_delayed(poll_call, deadline);
@@ -707,6 +789,7 @@ void boot_progress_exit(int pid, const char *name, int status, unsigned ns, uint
     snprintf(line, sizeof(line), "exit pid=%d %.16s status=%x ns=%u code=%llx", pid,
              name ? name : "?", status, ns, (unsigned long long)code);
     uint64_t flags = irq_save();
+    if (flags == UINT64_MAX) return;
     if (!panic_state && !busy) copy_line(exit_stage, sizeof(exit_stage), line);
     irq_restore(flags);
     boot_progress_stage(line);
