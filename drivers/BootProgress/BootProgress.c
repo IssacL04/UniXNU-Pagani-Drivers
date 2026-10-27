@@ -368,6 +368,19 @@ void boot_progress_touch_power(uint32_t address, uint32_t hardware, uint32_t tcs
     irq_restore(flags);
 }
 
+void boot_progress_touch_hid(uint32_t binding, uint32_t usage, uint32_t events, uint32_t digitizers,
+                             uint32_t edges, uint32_t input, uint64_t output, uint32_t mask)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) {
+        snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
+            "HID b=%x use=%x/%x ev=%u/%u e=%u", binding, usage>>16, usage&0xffff, events, digitizers, edges);
+        snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+            "XY in=%x/%x out=%x/%x mask=%x", input>>16, input&0xffff, (uint32_t)(output>>32), (uint32_t)output, mask);
+    }
+    irq_restore(flags);
+}
+
 void boot_progress_touch_smmu(uint32_t slot, uint32_t bank, uint32_t smr, uint32_t s2cr)
 {
     uint64_t flags = irq_save();

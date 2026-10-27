@@ -126,9 +126,28 @@ static void descriptor(const uint8_t *bytes,size_t length,bool touch) {
             case 0xc0:assert(depth);--depth;break;
         }
     }
-    assert(!depth && bits[1]==64 && bits[2]==8 && bits[3]==(touch?61*8:0));
-    assert(applications.size()==(touch?2:1) && applications[0]==std::make_pair(1u,6u));
-    if (touch) assert(applications[1]==std::make_pair(13u,4u));
+    assert(!depth && bits[1]==(touch?0:64) && bits[2]==(touch?0:8) && bits[3]==(touch?61*8:0));
+    assert(applications.size()==1 && applications[0]==(touch?std::make_pair(13u,4u):std::make_pair(1u,6u)));
+}
+
+static void edgeContacts() {
+    bool state[256]={};
+    auto edge=[&](unsigned id,bool changed,bool down,int x,int y) {
+        return pagani_touch_edge(state,id,changed,down,x,y,2048,1024);
+    };
+    assert(edge(2,true,true,32768,65535));
+    assert(edge(2,false,true,32768,32768));
+    assert(edge(2,true,false,32768,32768) && !state[2]);
+    assert(!edge(2,true,true,32768,32768));
+    assert(!edge(2,false,true,0,0)); // Moving to an edge does not create an edge-origin gesture.
+    assert(!edge(2,true,false,0,0));
+    for (auto point:std::vector<std::pair<int,int>>{{0,32768},{65536,32768},{32768,0},{32768,65536}}) {
+        assert(edge(255,true,true,point.first,point.second));
+        assert(edge(255,true,false,point.first,point.second) && !state[255]);
+    }
+    assert(!edge(256,true,true,0,0));
+    assert(!edge(0,true,true,-1,0) && !edge(0,true,true,65537,0));
+    assert(!edge(0,true,true,2048,1024) && !edge(0,true,true,65536-2048,65536-1024));
 }
 
 struct Tcm {
@@ -489,5 +508,5 @@ static void panel() {
 int main() {
     spiRead();touchV2();
     descriptor(buttonsDescriptor,sizeof buttonsDescriptor,false);descriptor(touchDescriptor,sizeof touchDescriptor,true);
-    touch();buttons();buses();panel();power();spiTiming();puts("PASS: SPI read bytes, TouchComm v1/v2 CRC/retry/fragments/bounds, HID contacts, buttons, RPMh ownership/ACK/timeout and SPI timing");
+    touch();edgeContacts();buttons();buses();panel();power();spiTiming();puts("PASS: SPI, TouchComm v1/v2, touchscreen identity, HID contacts/edge lifecycle, buttons, RPMh and timing");
 }

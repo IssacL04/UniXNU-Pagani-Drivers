@@ -207,6 +207,9 @@ int main(void)
     boot_progress_touch_read(4,0,13,1,0x40,4,4,0xc800);
     assert(!strcmp(peripheral_status[PAGANI_SPI], "SPI RX n=4 h=00000000 a=1/0 rst=3"));
     assert(!strcmp(peripheral_status[PAGANI_SPI_FIFO], "SPI dma=1 ti=4 ri=4 st=40 dly=c800"));
+    boot_progress_touch_hid(31,0xd0004,430,420,3,0x40007fff,0x800000010000ULL,0x802);
+    assert(!strcmp(peripheral_status[PAGANI_SPI], "HID b=1f use=d/4 ev=430/420 e=3"));
+    assert(!strcmp(peripheral_status[PAGANI_SPI_FIFO], "XY in=4000/7fff out=8000/10000 mask=802"));
     saved_row=row;saved_column=column;
     boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
@@ -231,10 +234,11 @@ int main(void)
     memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
     boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);
     boot_progress_touch_spi(0,0,0,0,0,0);boot_progress_touch_smmu(0,0,0,0);
-    boot_progress_touch_dma(0,0,0,0);boot_progress_touch_read(0,0,0,0,0,0,0,0);boot_progress_touch_power(0,0,0,0,0,0,0);boot_progress_peripheral_frame();
+    boot_progress_touch_dma(0,0,0,0);boot_progress_touch_read(0,0,0,0,0,0,0,0);boot_progress_touch_power(0,0,0,0,0,0,0);
+    boot_progress_touch_hid(0,0,0,0,0,0,0,0);boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
     assert(strstr(peripheral_status[PAGANI_KEYS],"PMIC sample"));
-    assert(strstr(peripheral_status[PAGANI_SPI_FIFO],"dma=1 ti=4 ri=4 st=40"));
+    assert(strstr(peripheral_status[PAGANI_SPI_FIFO],"in=4000/7fff out=8000/10000 mask=802"));
     free(snapshot);
     boot_progress_display_failed();
     assert(allocation[GUARD] == 0xffff4040 && !boot_progress_display_handoff());

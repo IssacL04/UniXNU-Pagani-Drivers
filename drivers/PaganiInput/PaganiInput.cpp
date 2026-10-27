@@ -8,6 +8,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <libkern/c++/OSString.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
 #include <SmmuTakeover.h>
 #include <Rpmh.h>
 extern "C" {
@@ -16,6 +17,7 @@ extern "C" {
 }
 
 #include "Reports.h"
+#include "HidEvents.h"
 #include "../BootProgress/PeripheralStatus.h"
 
 static void dmaCache(void *bytes,size_t size,unsigned operation) {
@@ -36,6 +38,7 @@ class PaganiInput : public IOHIDDevice {
     OSDeclareDefaultStructors(PaganiInput)
     IOWorkLoop *loop=nullptr;
     IOTimerEventSource *timer=nullptr;
+    IOService *touchEvents=nullptr;
     bool touch=false,running=false,timerAdded=false;
     PeripheralWindow core,cnfg,obs,gcc,se,wrapper,smmu,rsc,cmddb,pins[6];
     IOBufferMemoryDescriptor *dmaMemory=nullptr;
@@ -51,6 +54,7 @@ class PaganiInput : public IOHIDDevice {
     unsigned pinsConfigured=0;
     const char *phase="allocate";
     uint32_t sample=0;
+    uint32_t touchBinding=0,touchUsage=0xffffffff,lastInputXY=0;
     uint64_t reports=0;
     int touchError=0;
     char touchPhase[24]={};
@@ -222,7 +226,30 @@ class PaganiInput : public IOHIDDevice {
         observeTouch(rc);
         return rc;
     }
+    IOReturn bindTouchEvents() {
+        if (touchEvents) return touchEvents->isInactive()?kIOReturnNotReady:kIOReturnSuccess;
+        IOService *driver=pagani_hid::findDriver(this,4);
+        if (!driver) return kIOReturnNotReady;
+        touchBinding=1;
+        touchUsage=(pagani_hid::number(driver,"PrimaryUsagePage")<<16)|pagani_hid::number(driver,"PrimaryUsage");
+        if (*reinterpret_cast<uintptr_t **>(driver)==pagani_original_hid_driver_vtable) touchBinding|=2;
+        if (touchUsage==0xd0004) touchBinding|=4;
+        auto digitizer=OSDynamicCast(OSDictionary,driver->getProperty("Digitizer"));
+        if (driver->getProperty("Built-In")==kOSBooleanTrue && driver->getProperty("DisplayIntegrated")==kOSBooleanTrue &&
+            digitizer && digitizer->getObject("collectionDispatch")==kOSBooleanTrue) touchBinding|=8;
+        if (touchBinding!=15 || !pagani_hid::installDispatch(driver)) {driver->release();return kIOReturnUnsupported;}
+        touchBinding|=16;touchEvents=driver;return kIOReturnSuccess;
+    }
+    void showTouchEvents() {
+        boot_progress_touch_hid(touchBinding,touchUsage,__atomic_load_n(&pagani_hid::events,__ATOMIC_RELAXED),
+            __atomic_load_n(&pagani_hid::digitizers,__ATOMIC_RELAXED),__atomic_load_n(&pagani_hid::edges,__ATOMIC_RELAXED),
+            lastInputXY,__atomic_load_n(&pagani_hid::lastXY,__ATOMIC_RELAXED),__atomic_load_n(&pagani_hid::lastMask,__ATOMIC_RELAXED));
+    }
     bool send(const void *bytes,size_t size) {
+        if (touch) {
+            IOReturn rc=bindTouchEvents();
+            if (rc) {observe(rc==kIOReturnNotReady?"HID wait":"HID bind",rc);return false;}
+        }
         auto buffer=IOBufferMemoryDescriptor::withBytes(bytes,size,kIODirectionNone);
         IOReturn rc=buffer?handleReport(buffer,0,0):kIOReturnNoMemory;
         if (!rc) ++reports;
@@ -244,8 +271,10 @@ class PaganiInput : public IOHIDDevice {
                 s3910_frame frame={};int rc=s3910_poll(&self->controller,&frame);
                 if (rc==1) {
                     self->sample=0;for (unsigned i=0;i<S3910_CONTACTS;++i) if (frame.contact[i].active) self->sample|=1u<<i;
+                    for (auto &c:frame.contact) if (c.active) {self->lastInputXY=(uint32_t)c.x<<16|c.y;break;}
                     uint8_t report[62];s3910_hid_report(&frame,&self->previous,report);
                     if (self->send(report,sizeof report)) self->previous=frame;
+                    self->showTouchEvents();
                 } else if (rc<0) {
                     self->controller.ready=0;self->touchError=rc;self->setProperty("InputError",(uint32_t)rc,32);
                 } else {
@@ -271,6 +300,7 @@ class PaganiInput : public IOHIDDevice {
         __atomic_store_n(&running,false,__ATOMIC_RELEASE);
         if (timer) {timer->cancelTimeout();if (timerAdded) loop->removeEventSource(timer);}
         timerAdded=false;OSSafeReleaseNULL(timer);OSSafeReleaseNULL(loop);
+        OSSafeReleaseNULL(touchEvents);
         for (unsigned i=0;i<pinsConfigured;++i) {
             if (i==4) PeripheralWindow::write(&pins[i],4,savedReset);
             PeripheralWindow::write(&pins[i],0,savedPins[i]);
@@ -299,7 +329,16 @@ public:
         observe("work loop");
         loop=IOWorkLoop::workLoop();if (!loop) {observe(phase,kIOReturnNoMemory);return false;}
         setProperty("HIDDefaultBehavior",true);setProperty("Built-In",true);
-        if (touch) {setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);}
+        if (touch) {
+            setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);
+            PE_Video video={};
+            if (PE_current_console(&video) || video.v_rotate || video.v_width<=2*PAGANI_TOUCH_EDGE_PIXELS ||
+                video.v_height<=2*PAGANI_TOUCH_EDGE_PIXELS || !pagani_hid::installPersonality()) {
+                observe("HID identity",kIOReturnUnsupported);cleanup();return false;
+            }
+            pagani_hid::edgeX=PAGANI_TOUCH_EDGE_PIXELS*65536u/video.v_width;
+            pagani_hid::edgeY=PAGANI_TOUCH_EDGE_PIXELS*65536u/video.v_height;
+        }
         int rc=touch?setupTouch():setupButtons();
         if (rc) {observe(phase,rc);IOLog("Pagani %s %s failed: %d\n",touch?"touch":"buttons",phase,rc);cleanup();return false;}
         observe("HID start");
