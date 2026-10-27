@@ -38,7 +38,7 @@ class PaganiInput : public IOHIDDevice {
     bool touch=false,running=false,timerAdded=false;
     PeripheralWindow core,cnfg,obs,gcc,se,wrapper,smmu,pins[6];
     IOBufferMemoryDescriptor *dmaMemory=nullptr;
-    bool dmaExposed=false;
+    bool dmaExposed=false,firstReadCaptured=false;
     geni_spi spi={};
     s3910 controller={};
     s3910_frame previous={};
@@ -63,6 +63,8 @@ class PaganiInput : public IOHIDDevice {
     }
     int transferTouch(const uint8_t *tx,uint8_t *rx,size_t size) {
         spi.snap_valid=0;
+        bool capture=rx && !firstReadCaptured;
+        uint32_t pin=capture?(PeripheralWindow::read(&pins[5],4)&1):0;
         if (spi.use_dma) dmaExposed=true;
         int rc=geni_spi_transfer(&spi,tx,rx,size,0);
         // Preserve the driver's pre-cancel snapshot; live registers now describe recovery.
@@ -70,6 +72,15 @@ class PaganiInput : public IOHIDDevice {
             spi.snap_status,spi.snap_irq,spi.snap_txfs,spi.snap_rxfs);
         if (rc && spi.snap_valid && spi.use_dma) boot_progress_touch_dma(
             spi.snap_dma_tx,spi.snap_dma_rx,spi.snap_dma_txin,spi.snap_dma_rxin);
+        if (!rc && capture) {
+            uint32_t head=0;
+            for (size_t i=0;i<size && i<4;++i) head|=(uint32_t)rx[i]<<(8*i);
+            pin|=(PeripheralWindow::read(&pins[5],4)&1)<<1;
+            pin|=(PeripheralWindow::read(&pins[4],4)&3)<<2;
+            boot_progress_touch_read((uint32_t)size,head,pin,spi.use_dma,
+                spi.se.rd(spi.se.ctx,SE_GENI_STATUS),spi.last_tx_in,spi.last_rx_in);
+            firstReadCaptured=true;
+        }
         return rc;
     }
     static int readTouch(void *ctx,uint8_t *data,size_t size) {

@@ -12,10 +12,25 @@
 #include <PeripheralIO.h>
 #include "../../BootProgress/PeripheralStatus.h"
 
-static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots;
+static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots,readSnapshots,statusReads;
 static int spiResult;
+static uint8_t spiRxByte=0xa5;
 static uint32_t spiSnapshot[6];
 static uint32_t dmaSnapshot[4];
+static uint32_t readSnapshot[7];
+struct PeripheralWindow {
+    uint32_t values[2]={1,0};unsigned reads=0;
+    static uint32_t read(void *ctx,uint32_t reg) {
+        assert(reg==4);auto &p=*static_cast<PeripheralWindow *>(ctx);
+        return p.values[p.reads++?1:0];
+    }
+};
+static uint32_t spiStatus(void *,uint32_t reg) {assert(reg==SE_GENI_STATUS);++statusReads;return 0x40;}
+void boot_progress_touch_read(uint32_t length,uint32_t head,uint32_t pins,uint32_t dma,
+                              uint32_t state,uint32_t txin,uint32_t rxin) {
+    const uint32_t values[]={length,head,pins,dma,state,txin,rxin};
+    memcpy(readSnapshot,values,sizeof values);++readSnapshots;
+}
 void boot_progress_touch_dma(uint32_t tx,uint32_t rx,uint32_t txin,uint32_t rxin) {
     const uint32_t values[]={tx,rx,txin,rxin};memcpy(dmaSnapshot,values,sizeof values);++dmaSnapshots;
 }
@@ -27,18 +42,22 @@ static int touchTransfer(geni_spi *spi,const uint8_t *tx,uint8_t *rx,size_t size
     assert(tx && size && !keep && !spi->snap_valid);
     if (rx) {
         for (size_t i=0;i<size;++i) assert(tx[i]==0xff);
-        memset(rx,0xa5,size);++spiReads;
+        memset(rx,spiRxByte,size);++spiReads;
     } else ++spiWrites;
     if (spiResult) {
         spi->snap_valid=1;spi->snap_status=1;spi->snap_irq=0x40000000;
         spi->snap_txfs=1;spi->snap_rxfs=0;
         spi->snap_dma_tx=4;spi->snap_dma_rx=0;spi->snap_dma_txin=2;spi->snap_dma_rxin=1;
     }
+    spi->last_tx_in=spi->use_dma?(uint32_t)size:0;
+    spi->last_rx_in=spi->use_dma && rx?(uint32_t)size:0;
     return spiResult;
 }
 struct PaganiInput {
     geni_spi spi={};
-    bool dmaExposed=false;
+    bool dmaExposed=false,firstReadCaptured=false;
+    PeripheralWindow pins[6];
+    PaganiInput() {spi.se.rd=spiStatus;pins[4].values[0]=pins[4].values[1]=3;}
 #define geni_spi_transfer touchTransfer
 #include "PaganiReadTouch.inc"
 #undef geni_spi_transfer
@@ -47,7 +66,10 @@ static void spiRead() {
     PaganiInput device;uint8_t bytes[S3910_PAYLOAD_MAX+8]={};
     device.spi.info.fw_revision=0x101;device.spi.info.if_disable=1;
     assert(!PaganiInput::readTouch(&device,bytes,4) && bytes[0]==0xa5 && spiReads==1);
+    const uint32_t expectedRead[]={4,0xa5a5a5a5,13,0,0x40,0,0};
+    assert(readSnapshots==1 && statusReads==1 && !memcmp(readSnapshot,expectedRead,sizeof expectedRead));
     assert(!PaganiInput::readTouch(&device,bytes,sizeof(bytes)-1) && spiReads==2);
+    assert(readSnapshots==1 && statusReads==1 && device.pins[5].reads==2);
     assert(!spiSnapshots);
     spiResult=-110;assert(PaganiInput::readTouch(&device,bytes,4)==-110 && spiReads==3);
     const uint32_t expected[]={0x101,1,1,0x40000000,1,0};
@@ -63,6 +85,20 @@ static void spiRead() {
     assert(!PaganiInput::readTouch(&device,bytes,4) && device.dmaExposed && !dmaSnapshots);
     spiResult=-5;assert(PaganiInput::readTouch(&device,bytes,4)==-5 && dmaSnapshots==1);
     const uint32_t expectedDma[]={4,0,2,1};assert(!memcmp(dmaSnapshot,expectedDma,sizeof expectedDma));
+    spiResult=0;
+    // Build 54: a successful DMA read containing zeros must retain evidence even though TouchComm rejects it.
+    PaganiInput zero;zero.spi.use_dma=1;spiRxByte=0;
+    s3910 chip={};chip.bus={&zero,PaganiInput::readTouch,PaganiInput::writeTouch,[](void *,unsigned){}};
+    assert(s3910_start(&chip)==-71 && !chip.version && !chip.detail && !strcmp(chip.stage,"header"));
+    const uint32_t zeroRead[]={4,0,13,1,0x40,4,4};
+    assert(readSnapshots==2 && !memcmp(readSnapshot,zeroRead,sizeof zeroRead));
+    assert(zero.firstReadCaptured && zero.dmaExposed && !zero.spi.snap_valid);
+    spiRxByte=0xa5;
+    PaganiInput shortRead;uint8_t byte=0;
+    assert(!PaganiInput::readTouch(&shortRead,&byte,1) && readSnapshot[0]==1 && readSnapshot[1]==0xa5);
+    PaganiInput failed;spiResult=-110;unsigned before=statusReads;
+    assert(PaganiInput::readTouch(&failed,bytes,4)==-110 && !failed.firstReadCaptured);
+    assert(statusReads==before && failed.pins[5].reads==1 && failed.pins[4].reads==0);
     spiResult=0;
 }
 

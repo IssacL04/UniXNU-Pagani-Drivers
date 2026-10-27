@@ -342,6 +342,19 @@ void boot_progress_touch_dma(uint32_t tx, uint32_t rx, uint32_t txin, uint32_t r
     irq_restore(flags);
 }
 
+void boot_progress_touch_read(uint32_t length, uint32_t head, uint32_t pins, uint32_t dma,
+                              uint32_t state, uint32_t txin, uint32_t rxin)
+{
+    uint64_t flags = irq_save();
+    if (!panic_state) {
+        snprintf(peripheral_status[PAGANI_SPI], sizeof(peripheral_status[PAGANI_SPI]),
+            "SPI RX n=%x h=%08x a=%x/%x rst=%x", length, head, pins&1, (pins>>1)&1, (pins>>2)&3);
+        snprintf(peripheral_status[PAGANI_SPI_FIFO], sizeof(peripheral_status[PAGANI_SPI_FIFO]),
+            "SPI dma=%x ti=%x ri=%x st=%x", dma, txin, rxin, state);
+    }
+    irq_restore(flags);
+}
+
 void boot_progress_touch_smmu(uint32_t slot, uint32_t bank, uint32_t smr, uint32_t s2cr)
 {
     uint64_t flags = irq_save();
