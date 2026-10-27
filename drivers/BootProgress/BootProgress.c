@@ -273,8 +273,14 @@ void boot_progress_bind(uintptr_t base, unsigned w, unsigned h, unsigned pitch, 
 // Stop diagnostic drawing before the first system frame.
 int boot_progress_display_handoff(void)
 {
-    uint64_t flags = irq_save();
-    if (flags == UINT64_MAX) return 0;
+    uint64_t flags;
+    // A skipped handoff strands the pending swap; wait for the bounded writer.
+    while ((flags = irq_save()) == UINT64_MAX) {
+        if (__atomic_load_n(&panic_cpu, __ATOMIC_ACQUIRE)) return 0;
+#ifndef BOOT_PROGRESS_TEST
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
     int ready = framebuffer && !panic_state && !busy;
     if (ready) { display_owned = 1; barrier(); }
     irq_restore(flags);

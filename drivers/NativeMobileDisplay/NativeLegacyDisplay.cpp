@@ -210,6 +210,8 @@ public:
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
+    // GOP timing is firmware-owned; report our logical scanout state.
+    bool isTimingEnabled() override {return primary && bootMapping && displayOn;}
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
@@ -502,7 +504,6 @@ public:
     LEAF(306)
     LEAF(307)
     LEAF(338)
-    LEAF(345)
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)

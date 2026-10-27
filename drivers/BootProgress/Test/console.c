@@ -36,7 +36,20 @@ static uint64_t test_cpu;
 unsigned processor_count, processor_avail_count;
 unsigned long gPhysSize;
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
+static int release_on_contention;
+static unsigned exchange_for_test(unsigned *lock, unsigned value, int order)
+{
+    unsigned previous = __atomic_exchange_n(lock, value, order);
+    // Let the other CPU finish immediately after this failed acquisition.
+    if (previous && release_on_contention) {
+        release_on_contention = 0;
+        __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+    }
+    return previous;
+}
+#define __atomic_exchange_n exchange_for_test
 #include "../BootProgress.c"
+#undef __atomic_exchange_n
 volatile int native_owner_cache_stage;
 volatile uint64_t native_ufs_block_reads, native_ufs_block_failures;
 unsigned vm_page_free_count;
@@ -66,7 +79,11 @@ int main(void)
     assert(held != UINT64_MAX);
     test_cpu = 0x10000;
     boot_progress_stage("contended secondary");
-    assert(stage_count == previous && !boot_progress_display_handoff());
+    assert(stage_count == previous);
+    release_on_contention = 1;
+    assert(boot_progress_display_handoff());
+    assert(!release_on_contention && !console_lock && display_owned);
+    boot_progress_display_failed();
     test_cpu = 0;
     irq_restore(held);
     boot_progress_stage("uncontended boot CPU");
@@ -140,6 +157,7 @@ int main(void)
     console_smp = 1; console_lock = 1; // A stopped console owner cannot block panic.
     panic_for_test("Failed to mount %s: %u %llx %%", "root device", 60U, 0x123456789abcdef0ULL);
     assert(panic_state == 1 && busy);
+    assert(!boot_progress_display_handoff());
     assert(!strcmp(boot_progress_panic_text, "Failed to mount root device: 60 123456789abcdef0 %"));
     test_cpu = 0x10000;
     panic_for_test("second CPU must preserve first panic");

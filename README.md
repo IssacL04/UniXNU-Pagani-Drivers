@@ -7,7 +7,7 @@
 | 目录 | 用途与验证边界 |
 | --- | --- |
 | `drivers/PaganiArmDTPlatform` | ADT 平台设备注册，包含 13T 适配 |
-| `drivers/PaganiArmCpu` | CPU、GIC、定时器，当前只启用单核 |
+| `drivers/PaganiArmCpu` | CPU、GIC、定时器；八核候选已编译，在线状态及稳定性待真机验证 |
 | `drivers/PaganiDarwinBoot` | UEFI 到 XNU 的负载与内存交接 |
 | `drivers/NativeUfs` | SM8750 UFS、SMMU/DMA 和根卷读取；物理写入关闭 |
 | `drivers/NativeMobileDisplay` | NativeLegacyDisplay CPU 呈现、软件刷新；没有 SM8750 GPU 加速 |
@@ -63,3 +63,5 @@ SM8750 的 GCC/UFS、SMMU、SPMI 观察通道和 DSI FIFO 操作由同级 `UniXN
 `BootProgress`、`ShengPlatformPower` 和 `Stage7Probe` 来自设备仓库 `69952a9`。本仓库不包含 Apple IPSW、kernelcache、设备 DTB、厂商固件、密钥、磁盘镜像或构建产物。
 
 The SM8750 SMP candidate validates the full MPIDR affinity and uses atomic interrupt counters. BootProgress serializes normal diagnostics after VM setup, skips contended observations and preserves the first panic across CPUs without waiting for a stopped console owner. `pagani-platform-status=1` uses the existing overlay for registered/online CPU counts, per-core timer/IPI masks and RAM/free/available MiB; touch status remains separately opt-in. Host tests cover console contention and first-panic retention. Eight-core operation still needs a device boot.
+
+第 62 版在交换等待超时后的 slot 345 查询处触发保护。显示接管现在等待控制台当前写入结束，避免多核日志争锁使待呈现交换失去后续处理；panic 时仍立即退出。确定性回归在旧代码上复现接管失败，修复后通过。slot 345 返回本驱动的逻辑显示状态，原始调用 ABI 由主仓构建脚本核对；这不代表读到了面板硬件时序。新候选仍需完整编译和真机验证。
