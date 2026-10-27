@@ -7,12 +7,12 @@
 | 目录 | 用途与验证边界 |
 | --- | --- |
 | `drivers/PaganiArmDTPlatform` | ADT 平台设备注册，包含 13T 适配 |
-| `drivers/PaganiArmCpu` | CPU、GIC、定时器；八核候选已编译，在线状态及稳定性待真机验证 |
+| `drivers/PaganiArmCpu` | CPU、GIC、定时器；第 63 版已确认八核在线及每核中断记录，长期稳定性待验证 |
 | `drivers/PaganiDarwinBoot` | UEFI 到 XNU 的负载与内存交接 |
 | `drivers/NativeUfs` | SM8750 UFS、SMMU/DMA 和根卷读取；物理写入关闭 |
 | `drivers/NativeMobileDisplay` | NativeLegacyDisplay CPU 呈现、软件刷新；没有 SM8750 GPU 加速 |
-| `drivers/PaganiInput` | S3910 LBP 触摸、PMIC 电源／音量键与 HID；模拟测试通过，待完整构建与真机验收 |
-| `drivers/PaganiPanel` | DSI 亮度、显示开关及背光类接入；模拟测试通过，待完整构建与真机验收 |
+| `drivers/PaganiInput` | S3910 LBP 触摸、PMIC 电源／音量键与 HID；第 63 版基本触摸正常，多点与边缘手势待专项验证 |
+| `drivers/PaganiPanel` | DSI 亮度、显示开关及背光类接入；已通过完整构建，亮度等面板控制仍待真机验收 |
 | `drivers/NativeAES` | 当前构建使用的 AES 接口，未单独验收硬件功能 |
 | `drivers/NativeVirtioBlock` | 构建与存储依赖，不代表 13T 有可用的 Virtio 硬件 |
 | `drivers/NativeRamBlock` | 临时可写 RAM Data，重启后丢失修改 |
@@ -23,7 +23,7 @@
 | `kits/NativePrelink` | 原版组件预链接、Mach-O 与 ABI 工具 |
 | `kits/PaganiVerifiedRoot` | 根卷策略与校验库 |
 
-这 14 个驱动／诊断目录与 2 个 kit 收录当前构建所需源码。新增输入与面板实现仍需完整构建和真机验证；未纳入 Adreno、Metal、网络等模块。第 39 版的真机记录见设备仓库 README 和 STAGE6.md。
+这 14 个驱动／诊断目录与 2 个 kit 收录当前构建所需源码。第 63 版已确认八核在线与基本触摸，面板亮度和完整输入验收仍未完成；未纳入 Adreno、Metal、网络等模块。各版真机记录见设备仓库 README 和 STAGE6.md。
 
 ## 使用和开发
 
@@ -62,6 +62,6 @@ SM8750 的 GCC/UFS、SMMU、SPMI 观察通道和 DSI FIFO 操作由同级 `UniXN
 
 `BootProgress`、`ShengPlatformPower` 和 `Stage7Probe` 来自设备仓库 `69952a9`。本仓库不包含 Apple IPSW、kernelcache、设备 DTB、厂商固件、密钥、磁盘镜像或构建产物。
 
-The SM8750 SMP candidate validates the full MPIDR affinity and uses atomic interrupt counters. BootProgress serializes normal diagnostics after VM setup, skips contended observations and preserves the first panic across CPUs without waiting for a stopped console owner. `pagani-platform-status=1` uses the existing overlay for registered/online CPU counts, per-core timer/IPI masks and RAM/free/available MiB; touch status remains separately opt-in. Host tests cover console contention and first-panic retention. Eight-core operation still needs a device boot.
+The SM8750 SMP candidate validates the full MPIDR affinity and uses atomic interrupt counters. BootProgress serializes normal diagnostics after VM setup, skips contended observations and preserves the first panic across CPUs without waiting for a stopped console owner. `pagani-platform-status=1` uses the existing overlay for registered/online CPU counts, per-core timer/IPI masks and RAM/free/available MiB; touch status remains separately opt-in. Host tests cover console contention and first-panic retention. On build 63, the user confirmed system startup and normal touch with `reg=8 online=8 T=ff I=ff` and 4096 MiB RAM. IPI coverage may include the enabled self-test; directed cross-core stress and long-term stability remain unqualified.
 
-第 62 版在交换等待超时后的 slot 345 查询处触发保护。显示接管现在等待控制台当前写入结束，避免多核日志争锁使待呈现交换失去后续处理；panic 时仍立即退出。确定性回归在旧代码上复现接管失败，修复后通过。slot 345 返回本驱动的逻辑显示状态，原始调用 ABI 由主仓构建脚本核对；这不代表读到了面板硬件时序。[第 63 次完整构建](https://github.com/IssacL04/UniXNU-Pagani_SM8750/actions/runs/40520726310) 已通过；下载后的最终内核确认了 slot 345 绑定和接管重试代码，真机超时是否消失仍待验证。
+第 62 版在交换等待超时后的 slot 345 查询处触发保护。显示接管现在等待控制台当前写入结束，避免多核日志争锁使待呈现交换失去后续处理；panic 时仍立即退出。确定性回归在旧代码上复现接管失败，修复后通过。slot 345 返回本驱动的逻辑显示状态，原始调用 ABI 由主仓构建脚本核对；这不代表读到了面板硬件时序。[第 63 次完整构建](https://github.com/IssacL04/UniXNU-Pagani_SM8750/actions/runs/40520726310) 已通过；下载后的最终内核确认了 slot 345 绑定和接管重试代码，用户随后确认第 63 版进入系统且触摸正常；持续交换可靠性仍待验证。
