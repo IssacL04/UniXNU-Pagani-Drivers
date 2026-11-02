@@ -9,6 +9,8 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "NativeGOPWire.h"
+#define NATIVE_GPU_TRACE_OPTIONAL
+#include "NativeGpuTrace.h"
 extern "C" {
 volatile uint32_t native_gop_ready,native_gop_failures;
 volatile uint64_t native_gop_transfers,native_gop_bytes,native_gop_physical,native_gop_virtual;
@@ -49,6 +51,10 @@ class NativeGOPPresenter : public IOService {
     struct SurfaceMap {IOMemoryDescriptor *memory;IOMemoryMap *map;uint32_t id;};
     SurfaceMap surfaces[6]{};
     uint32_t mappingSequence=0;
+    bool capturePixels=false;
+    unsigned captured=0;
+    uint64_t capturedAt=0;
+    void captureScanout(uint64_t sequence);
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
     IOReturn completeSwap(task_t,uint64_t sequence,int status,const NGPCompleteTimed *timing=nullptr);
     IOReturn overlay(task_t,NGPOverlay *);
@@ -105,6 +111,7 @@ bool NativeGOPPresenter::start(IOService *provider) {
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+    {unsigned v=0;PE_parse_boot_argn("sheng-gpu-pixels",&v,sizeof v);capturePixels=(v==1);}
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
@@ -149,6 +156,7 @@ bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t
     if(accepted) {
         memory->retain();
         swap={true,false,++swapSequence,mach_absolute_time(),0,display,memory,nullptr,stride,width,height};
+        gpuTraceEvent(GpuTraceDisplay,0,swap.sequence,1,reinterpret_cast<uintptr_t>(memory));
         native_gop_gpu_offers=native_gop_gpu_offers+1;
         IOLockWakeup(gate,&swap,false);
     }
@@ -205,11 +213,49 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
     out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=mappingId;
     swap.deliveredAt=mach_absolute_time();
+    gpuTraceEvent(GpuTraceDisplay,0,sequence,2,out->address,mappingId);
     IOLockUnlock(gate);return kIOReturnSuccess;
+}
+void NativeGOPPresenter::captureScanout(uint64_t sequence) {
+    if(!capturePixels || captured>=3 || !mapping || !&native_gpu_trace_enabled ||
+       !native_gpu_trace_enabled() || !&native_gpu_pixel_put)return;
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    if(captured && ns-capturedAt<30000000000ull)return;
+    if(!mode.width || !mode.height || mode.width>16384 || mode.height>16384 || (mode.stride&3) || mode.stride<mode.width*4ull ||
+       mode.stride>UINT64_MAX/mode.height || mapping->getLength()<mode.stride*mode.height ||
+       !mapping->getVirtualAddress())return;
+    const uint32_t w=mode.width<64?mode.width:64,h=mode.height<64?mode.height:64,bytes=w*h*4;
+    auto *grid=static_cast<uint32_t *>(IOMalloc(bytes));if(!grid)return;
+    const auto *source=reinterpret_cast<const volatile uint8_t *>(mapping->getVirtualAddress());
+    bool changed=false;
+    for(unsigned pass=0;pass<2;++pass)for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x) {
+        const uint64_t offset=(uint64_t(y)*mode.height/h)*mode.stride+(uint64_t(x)*mode.width/w)*4;
+        const uint32_t value=*reinterpret_cast<const volatile uint32_t *>(source+offset);
+        if(pass)changed|=grid[y*w+x]!=value;else grid[y*w+x]=value;
+    }
+    NativeGpuPixelPiece piece{};
+    auto &p=piece.header;
+    p.magic=0x31585047;p.version=1;p.stage=3;p.capture=sequence;p.us=ns/1000;p.command=sequence;
+    p.physical=mapping->getPhysicalAddress();p.width=mode.width;p.height=mode.height;
+    p.format=80;p.source_stride=mode.stride;p.grid_width=w;p.grid_height=h;p.row_bytes=w*4;p.bytes_per_pixel=4;
+    // The client has completed its GPU copy; this does not establish a hardware display latch.
+    p.flags=1|(changed?4:0);p.bytes=bytes;
+    int result=0;
+    for(uint32_t offset=0;offset<bytes;offset+=piece.bytes) {
+        piece.offset=offset;piece.bytes=bytes-offset<NativeGpuPixelChunk?bytes-offset:uint32_t(NativeGpuPixelChunk);
+        memcpy(piece.data,reinterpret_cast<const uint8_t *>(grid)+offset,piece.bytes);
+        if((result=native_gpu_pixel_put(&piece,0)))break;
+    }
+    IOFree(grid,bytes);++captured;capturedAt=ns;
+    gpuTraceEvent(GpuTraceDisplayPixel,0,sequence,result,p.physical,p.format,bytes,0,1,0);
 }
 IOReturn NativeGOPPresenter::completeSwap(task_t task,uint64_t sequence,int status,const NGPCompleteTimed *timing) {
     IOLockLock(gate);
     if(task!=gpuTask || !swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    gpuTraceEvent(GpuTraceDisplay,0,sequence,status?4:3);
+    gpuTraceEvent(GpuTraceDisplaySurface,0,sequence,mapping?mapping->getPhysicalAddress():0,
+                  mode.width,mode.height,mode.stride,80,0,mode.bytes);
+    if(!status)captureScanout(sequence);
     auto done=swap;swap={};
     IOLockUnlock(gate);
     OSSafeReleaseNULL(done.map);done.memory->release();
@@ -241,6 +287,7 @@ void NativeGOPPresenter::abandonSwap(task_t task) {
     for(auto &entry:retired) {OSSafeReleaseNULL(entry.map);OSSafeReleaseNULL(entry.memory);}
     if(previous)task_deallocate(previous);
     if(!done.offered)return;
+    gpuTraceEvent(GpuTraceDisplay,0,done.sequence,5);
     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
