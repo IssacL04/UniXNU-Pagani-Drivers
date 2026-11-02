@@ -10,7 +10,7 @@
 | `drivers/PaganiArmCpu` | CPU、GIC、定时器；第 63 版已确认八核在线及每核中断记录，长期稳定性待验证 |
 | `drivers/PaganiDarwinBoot` | UEFI 到 XNU 的负载与内存交接 |
 | `drivers/NativeUfs` | SM8750 UFS、SMMU/DMA 和根卷读取；物理写入关闭 |
-| `drivers/NativeMobileDisplay` | NativeLegacyDisplay CPU 呈现、软件刷新；没有 SM8750 GPU 加速 |
+| `drivers/NativeMobileDisplay` | NativeLegacyDisplay CPU 呈现、软件刷新；GPU presenter 候选已接线，等待实机验证 |
 | `drivers/PaganiInput` | S3910 LBP 触摸、PMIC 电源／音量键与 HID；第 63 版基本触摸正常，多点与边缘手势待专项验证 |
 | `drivers/PaganiPanel` | DSI 亮度、显示开关及背光类接入；已通过完整构建，亮度等面板控制仍待真机验收 |
 | `drivers/NativeAES` | 当前构建使用的 AES 接口，未单独验收硬件功能 |
@@ -65,3 +65,7 @@ SM8750 的 GCC/UFS、SMMU、SPMI 观察通道和 DSI FIFO 操作由同级 `UniXN
 The SM8750 SMP candidate validates the full MPIDR affinity and uses atomic interrupt counters. BootProgress serializes normal diagnostics after VM setup, skips contended observations and preserves the first panic across CPUs without waiting for a stopped console owner. `pagani-platform-status=1` uses the existing overlay for registered/online CPU counts, per-core timer/IPI masks and RAM/free/available MiB; touch status remains separately opt-in. Host tests cover console contention and first-panic retention. On build 63, the user confirmed system startup and normal touch with `reg=8 online=8 T=ff I=ff` and 4096 MiB RAM. IPI coverage may include the enabled self-test; directed cross-core stress and long-term stability remain unqualified.
 
 第 62 版在交换等待超时后的 slot 345 查询处触发保护。显示接管现在等待控制台当前写入结束，避免多核日志争锁使待呈现交换失去后续处理；panic 时仍立即退出。确定性回归在旧代码上复现接管失败，修复后通过。slot 345 返回本驱动的逻辑显示状态，原始调用 ABI 由主仓构建脚本核对；这不代表读到了面板硬件时序。[第 63 次完整构建](https://github.com/IssacL04/UniXNU-Pagani_SM8750/actions/runs/40520726310) 已通过；下载后的最终内核确认了 slot 345 绑定和接管重试代码，用户随后确认第 63 版进入系统且触摸正常；持续交换可靠性仍待验证。
+
+GPU 诊断候选在 `pagani-platform-status=1` 的 CPU/RAM 两行后增加 GPU 阶段/返回码、Metal 连接与调用、提交/完成/超时，以及 CPU 显示拷贝率和耗时。GPU snapshot 使用 try-lock 并在锁忙时保留带标记的缓存；方法编号/返回值成对记录。状态采样和栅格化限制为 4 Hz，协商后的 GPU/CPU 呈现避让日志行，日志每 250 ms 只重绘变化字符；旧客户端仍每帧覆盖缓存像素，并分别显示 GPU/CPU 帧率、交接/拷贝和覆盖耗时。板级 CLK 行显示请求频率、受电源条件保护的忙闲采样及未知的活动 SP 数。失败阶段独立保留，panic 后停止采样与绘制。无 GPU 包时保留原两行。Host 控制台边界、帧率与 panic 回归通过；完整构建和实机显示待验证。
+
+GPU 汇总候选在 A830 初始化、自检及服务注册成功后启动已有 NativeGOPPresenter，Metal 配置通过 `sheng-fb-gpu=1` 选择它。presenter 保留帧与映射至完成，并在映射失败或 handoff 客户端关闭时通知 CPU 回退；实际代码的归属、尺寸、完成和释放回归已通过。Run 78 完整内核/Metal 构建和本地镜像回读已通过；该路径尚未在 13T 上完成 GPU 呈现实测。

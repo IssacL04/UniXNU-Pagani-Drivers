@@ -85,7 +85,7 @@ public:
         // Publish only with real AppleARMBacklight ancestry: CoreBrightness uses IOObjectConformsTo.
         setProperty("backlight-control",true);setProperty("Built-In",true);
         setProperty("PanelMaxBrightness",PAGANI_BRIGHTNESS_MAX,32);
-        setProperty("PanelRefreshSource","firmware timing; software presentation at 60 Hz");
+        setProperty("PanelRefreshSource","firmware timing; boot-configured software presentation");
         registerService();return true;
     }
     IOReturn setProperties(OSObject *properties) override {

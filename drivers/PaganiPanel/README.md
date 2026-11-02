@@ -6,6 +6,6 @@ DSI brightness and display blanking for the OnePlus 13T AA594_P_7_A0020 panel. E
 
 `Sm8750Platform/PeripheralIO.h` uses the DSI command FIFO, waits for the command path to be idle and preserves unrelated interrupt status. A completion timeout disables subsequent requests and leaves the outstanding command untouched. The first brightness command must succeed before the service advertises `backlight-control`.
 
-The current refresh source remains the existing 60 Hz software presentation timer. Logical display-off pauses notifications, and display-on starts a fresh deadline. No panel timing, DSC mode or refresh rate is changed. TE/vblank synchronization and high-refresh modes require hardware measurements.
+The current refresh source remains the boot-configured software presentation timer (60 Hz in the CPU profile; 120 Hz in the Metal candidate). Logical display-off pauses notifications, and display-on starts a fresh deadline. No panel timing, DSC mode or refresh rate is changed. TE/vblank synchronization and high-refresh modes require hardware measurements.
 
 The portable tests cover packet byte order, register preservation, busy engines and completion timeouts. They do not verify physical luminance, CoreBrightness sandbox access, display-off/on behavior or coexistence with the firmware scanout. FadePeriod interpolation and full panel suspend/resume are not implemented.

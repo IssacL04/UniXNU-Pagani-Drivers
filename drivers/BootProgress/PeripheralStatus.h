@@ -8,6 +8,11 @@ extern "C" {
 enum { PAGANI_KEYS, PAGANI_TOUCH, PAGANI_PANEL, PAGANI_SPI, PAGANI_SPI_FIFO, PAGANI_PERIPHERALS };
 void boot_progress_peripheral_enable(int enabled);
 void boot_progress_platform_enable(int enabled);
+enum { PAGANI_GPU_ROWS = 7, PAGANI_STATUS_BYTES = 80 };
+int pagani_gpu_status(char lines[PAGANI_GPU_ROWS][PAGANI_STATUS_BYTES]);
+void boot_progress_display_copy(uint64_t ticks, uint64_t bytes);
+void boot_progress_overlay_rows(uint32_t *first, uint32_t *rows);
+void boot_progress_overlay_preserve(int enabled);
 void boot_progress_peripheral(unsigned device, const char *stage, int32_t result, uint32_t value, uint64_t reports);
 void boot_progress_touch_spi(uint32_t firmware, uint32_t disabled, uint32_t state, uint32_t irq, uint32_t tx, uint32_t rx);
 void boot_progress_touch_dma(uint32_t tx, uint32_t rx, uint32_t txin, uint32_t rxin);

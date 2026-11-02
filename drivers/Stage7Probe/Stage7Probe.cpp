@@ -17,12 +17,18 @@ extern "C" int boot_progress_display_handoff(void);
 extern "C" void boot_progress_display_failed(void);
 extern "C" void boot_progress_display_status(const char *,uint64_t);
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
+extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
+extern "C" IOService *native_gop_presenter_create(void);
+extern "C" void native_gop_presenter_set_source(IOService *,IOService *);
+extern "C" bool native_gop_gpu_offer(IOService *,void *,IOMemoryDescriptor *,uint64_t,uint32_t,uint32_t);
 extern "C" void native_keyevents_static_init(void) __asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp");
 extern "C" IOService *native_legacy_display_allocate(void),*native_keyevents_allocate(void);
 extern "C" void pagani_input_static_init(void) __asm__("__GLOBAL__sub_I_PaganiInput.cpp");
 extern "C" void pagani_panel_static_init(void) __asm__("__GLOBAL__sub_I_PaganiPanel.cpp");
 extern "C" IOService *pagani_input_allocate(bool),*pagani_panel_allocate(void);
-static IOService *pendingDisplay;
+extern "C" __attribute__((weak)) int pagani_gpu_start(void) {return kIOReturnNotFound;}
+static IOService *pendingDisplay,*gpuPresenter;
+static bool gpuReady;
 static bool displayInitialized,ephemeralState;
 static uint64_t frames,clients,aksCalls,aksOpens;
 
@@ -67,6 +73,22 @@ static void startPeripherals(bool hidReady) {
         boot_progress_peripheral(PAGANI_PANEL,loaded?"platform load":"panel class",loaded?loaded:(ready?0:kIOReturnNotReady),0,0);
         if (ready) startPeripheral(pagani_panel_allocate(),"DSI panel control started",PAGANI_PANEL);
     }
+    // Touch's startup RPMh transactions have completed; these drivers retain votes thereafter.
+    if (enabled("pagani-gpu")) {
+        int rc=pagani_gpu_start();gpuReady=rc==0;progress("A830 startup",uint32_t(rc));
+    }
+}
+static void startGpuPresenter(IOService *nub) {
+    if(!gpuReady || !enabled("sheng-fb-gpu") || !registerClass(native_gop_presenter_static_init))return;
+    IOService *service=native_gop_presenter_create(),*home=IOService::getResourceService();
+    bool attached=false;
+    if(service && home && service->init()) {
+        native_gop_presenter_set_source(service,nub);
+        attached=service->attach(home);
+        if(attached && service->start(home)) {gpuPresenter=service;progress("GPU scanout ready",1);return;}
+    }
+    if(attached)service->detach(home);
+    OSSafeReleaseNULL(service);progress("GPU scanout unavailable",0);
 }
 static bool console(PE_Video &video) {
     return !PE_current_console(&video) && video.v_baseAddr && video.v_width && video.v_height &&
@@ -83,7 +105,13 @@ bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *mapping,uint32_
 }
 void native_legacy_registration_observed(IOService *) {progress("display registered",1);}
 void native_legacy_swap_stage(unsigned) {}
-void native_legacy_vsync_observed(unsigned event,unsigned hz) {if(event==4)progress("software display refresh Hz",hz);}
+volatile uint64_t native_gop_vsync[3]; // requested Hz, software notifications, missed deadlines
+void native_legacy_vsync_observed(unsigned event,unsigned hz) {
+    if(event==4 || event==5)__atomic_store_n(&native_gop_vsync[0],hz,__ATOMIC_RELAXED);
+    if(event==1)__atomic_fetch_add(&native_gop_vsync[1],1,__ATOMIC_RELAXED);
+    if(event==3)__atomic_fetch_add(&native_gop_vsync[2],1,__ATOMIC_RELAXED);
+    if(event==4)progress("software display refresh Hz",hz);
+}
 void native_legacy_client_enter(task_t,uint32_t type) {progress("display client enter",type);}
 void native_legacy_client_observed(IOReturn status,IOUserClient *) {progress("display client",status?(uint32_t)status:++clients);}
 void native_legacy_pm_observed(unsigned stage,IOReturn status,unsigned long) {if(status)progress("display PM error",((uint64_t)stage<<32)|(uint32_t)status);}
@@ -102,10 +130,13 @@ void native_legacy_transfer_observed(IOReturn status,const void *,uint64_t) {
         boot_progress_peripheral_frame();
     }
 }
-void native_legacy_copy_timing_observed(uint64_t,uint64_t) {}
+void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes) {boot_progress_display_copy(ticks,bytes);}
+void native_legacy_overlay_rows(uint32_t *first,uint32_t *rows) {boot_progress_overlay_rows(first,rows);}
+void native_legacy_overlay_preserve(int enabled) {boot_progress_overlay_preserve(enabled);}
 void native_legacy_retirement_observed(IOService *) {}
-// shortcut: CPU scanout only until the SM8750 GPU and its synchronization are implemented.
-bool native_legacy_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,uint32_t,uint32_t) {return false;}
+bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+    return gpuPresenter && native_gop_gpu_offer(gpuPresenter,display,memory,stride,width,height);
+}
 void native_legacy_gpu_fallback_observed(int) {}
 void native_keyevents_open_refused(void) {progress("key state open refused",0);}
 bool native_aks_state_enabled(void) {return ephemeralState;}
@@ -199,7 +230,7 @@ extern "C" void native_legacy_display_late_probe(void) {
         }
     }
     progress("GOP display started",started);
-    if (started) startPeripherals(hidReady);
+    if (started) {startPeripherals(hidReady);startGpuPresenter(nub);}
     OSSafeReleaseNULL(ranges);OSSafeReleaseNULL(memory);OSSafeReleaseNULL(typeData);
     if(!started) {
         if(attached)display->detach(nub);

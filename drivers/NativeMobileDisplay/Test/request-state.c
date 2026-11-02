@@ -33,17 +33,17 @@ int main(void) {
             assert(!native_legacy_blank_state(updated,disabled,0) || (updated && updated==disabled));
     {
         uint32_t frame[24];memset(frame,0xcc,sizeof(frame));
-        assert(native_legacy_fill_pixels(frame,64,16,3,4,0xff000000U));
+        assert(native_legacy_fill_pixels(frame,64,16,3,4,0xff000000U,0,0));
         for(unsigned row=0;row<4;++row) {
             for(unsigned column=0;column<3;++column)assert(frame[row*4+column]==0xff000000U);
             assert(frame[row*4+3]==0xcccccccc);
         }
         for(unsigned i=16;i<24;++i)assert(frame[i]==0xcccccccc);
         uint32_t before[24];memcpy(before,frame,sizeof(frame));
-        assert(!native_legacy_fill_pixels((unsigned char *)frame+1,64,16,3,4,0));
-        assert(!native_legacy_fill_pixels(frame,63,16,3,4,0));
-        assert(!native_legacy_fill_pixels(frame,64,14,3,4,0));
-        assert(!native_legacy_fill_pixels(frame,64,16,0,4,0));
+        assert(!native_legacy_fill_pixels((unsigned char *)frame+1,64,16,3,4,0,0,0));
+        assert(!native_legacy_fill_pixels(frame,63,16,3,4,0,0,0));
+        assert(!native_legacy_fill_pixels(frame,64,14,3,4,0,0,0));
+        assert(!native_legacy_fill_pixels(frame,64,16,0,4,0,0,0));
         assert(!memcmp(before,frame,sizeof(frame)));
     }
     {
@@ -76,7 +76,7 @@ int main(void) {
         unsigned char storage[80]; uint32_t target[20];
         for(unsigned i=0;i<sizeof(storage);++i)storage[i]=(unsigned char)(i+1);
         memset(target,0xcc,sizeof(target));
-        assert(native_legacy_copy_pixels(target,60,20,storage+offset,51,17,3,3));
+        assert(native_legacy_copy_pixels(target,60,20,storage+offset,51,17,3,3,0,0));
         const unsigned char *result=(const unsigned char *)target;
         for(unsigned row=0;row<3;++row) {
             assert(!memcmp(result+row*20,storage+offset+row*17,12));
@@ -84,11 +84,26 @@ int main(void) {
         }
         for(unsigned i=60;i<sizeof(target);++i)assert(result[i]==0xcc);
         uint32_t before[20];memcpy(before,target,sizeof(target));
-        assert(!native_legacy_copy_pixels((unsigned char *)target+1,60,20,storage,51,17,3,3));
-        assert(!native_legacy_copy_pixels(target,63,21,storage,51,17,3,3));
-        assert(!native_legacy_copy_pixels(target,60,20,storage,50,17,3,3));
-        assert(!native_legacy_copy_pixels(target,59,20,storage,51,17,3,3));
-        assert(!native_legacy_copy_pixels(target,60,20,(const void *)(UINTPTR_MAX-16),51,17,3,3));
+        assert(!native_legacy_copy_pixels((unsigned char *)target+1,60,20,storage,51,17,3,3,0,0));
+        assert(!native_legacy_copy_pixels(target,63,21,storage,51,17,3,3,0,0));
+        assert(!native_legacy_copy_pixels(target,60,20,storage,50,17,3,3,0,0));
+        assert(!native_legacy_copy_pixels(target,59,20,storage,51,17,3,3,0,0));
+        assert(!native_legacy_copy_pixels(target,60,20,(const void *)(UINTPTR_MAX-16),51,17,3,3,0,0));
+        assert(!memcmp(before,target,sizeof(target)));
+    }
+    {
+        uint32_t source[24],target[24],before[24];
+        for(unsigned i=0;i<24;++i)source[i]=i+1;
+        memset(target,0xcc,sizeof(target));
+        assert(native_legacy_copy_pixels(target,sizeof(target),24,source,sizeof(source),24,5,4,1,2));
+        for(unsigned y=0;y<4;++y)for(unsigned x=0;x<6;++x)
+            assert(target[y*6+x]==((y==1 || y==2 || x==5)?0xcccccccc:source[y*6+x]));
+        assert(native_legacy_fill_pixels(target,sizeof(target),24,5,4,7,1,2));
+        for(unsigned y=0;y<4;++y)for(unsigned x=0;x<6;++x)
+            assert(target[y*6+x]==((y==1 || y==2 || x==5)?0xcccccccc:7));
+        memcpy(before,target,sizeof(target));
+        assert(!native_legacy_copy_pixels(target,sizeof(target),24,source,sizeof(source),24,5,4,3,2));
+        assert(!native_legacy_fill_pixels(target,sizeof(target),24,5,4,0,1,UINT32_MAX));
         assert(!memcmp(before,target,sizeof(target)));
     }
     return 0;

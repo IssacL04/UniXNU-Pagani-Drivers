@@ -52,12 +52,14 @@ static inline int native_legacy_copy_layout(volatile void *destination,
 }
 static inline int native_legacy_fill_pixels(volatile void *destination,
     uint64_t destinationBytes, uint64_t destinationStride,
-    uint32_t width, uint32_t height, uint32_t value) {
+    uint32_t width, uint32_t height, uint32_t value, uint32_t skipFirst, uint32_t skipRows) {
     uintptr_t dst=(uintptr_t)destination;
+    if (skipFirst>height || skipRows>height-skipFirst) return 0;
     if (!dst || (dst&3) || (destinationStride&3) ||
         !native_legacy_surface_bounds(width,height,destinationStride,destinationBytes,destinationBytes) ||
         destinationBytes>UINTPTR_MAX || dst>UINTPTR_MAX-destinationBytes) return 0;
     for (uint32_t row=0;row<height;++row) {
+        if (row>=skipFirst && row-skipFirst<skipRows) continue;
         volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
         for (uint32_t column=0;column<width;++column)out[column]=value;
     }
@@ -114,7 +116,8 @@ static inline int native_legacy_frame_colors(const void *source, uint64_t source
 }
 static inline int native_legacy_copy_pixels(volatile void *destination,
     uint64_t destinationBytes, uint64_t destinationStride, const void *source,
-    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
+    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height, uint32_t skipFirst, uint32_t skipRows) {
+    if (skipFirst>height || skipRows>height-skipFirst) return 0;
     if (!native_legacy_copy_layout(destination,destinationBytes,destinationStride,
         source,sourceBytes,sourceStride,width,height)) return 0;
     uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
@@ -123,6 +126,7 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
     // The destination base and stride are 8-byte aligned in practice (checked here); otherwise 32-bit stores remain.
     int wide=!(dst&7) && !(destinationStride&7);
     for (uint32_t row=0;row<height;++row) {
+        if (row>=skipFirst && row-skipFirst<skipRows) continue;
         volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
         const unsigned char *in=(const unsigned char *)(src+row*sourceStride);
         uint32_t column=0;

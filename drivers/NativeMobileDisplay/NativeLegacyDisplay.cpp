@@ -1,4 +1,6 @@
 #include "NativeLegacyRequest.h"
+#include "NativeGOPWire.h"
+extern "C" void native_legacy_overlay_rows(uint32_t *,uint32_t *);
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Reuse the unchanged original generic framebuffer implementation. Unknown
 // backend leaves stop; this class is not yet a published system display.
@@ -264,8 +266,9 @@ public:
                 native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
             }
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            NGPOverlay overlay{};native_legacy_overlay_rows(&overlay.first,&overlay.rows);
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-                bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
+                bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U,overlay.first,overlay.rows)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
@@ -324,6 +327,7 @@ public:
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+        NGPOverlay overlay{};native_legacy_overlay_rows(&overlay.first,&overlay.rows);
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
         uint64_t stored=UINT64_MAX;
         {
@@ -335,7 +339,7 @@ public:
             static int diffOff=-1;
             if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
             if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
-            if(!diffOff && shadow && shadowBytes>=need)
+            if(!overlay.rows && !diffOff && shadow && shadowBytes>=need)
                 stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                     bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                     source->getLength(),sourceStride,width,height,shadow,shadowValid);
@@ -345,10 +349,10 @@ public:
             shadowValid=false;
             if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-                source->getLength(),sourceStride,width,height)) {
+                source->getLength(),sourceStride,width,height,overlay.first,overlay.rows)) {
                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
-            stored=length;
+            stored=(uint64_t)width*(height-overlay.rows)*4;
         }
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}

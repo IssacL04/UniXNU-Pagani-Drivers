@@ -294,6 +294,7 @@ struct MMIO {
 };
 struct Rsc : MMIO {
     unsigned major,wait,control,status,enable,msg,stride,pending=~0u;
+    unsigned command_mask=7;
     uint32_t ignored=~0u;
     bool partial=false;
     explicit Rsc(unsigned version=3):major(version),wait(version==2?0x10:0x20),
@@ -309,7 +310,7 @@ struct Rsc : MMIO {
         for (unsigned i=0;i<3;++i) {
             unsigned b=0xd00+i*0x2a0;
             if (reg==b+m.control && (value&(1u<<24))) {
-                assert(value==(1u<<24|1u<<16) && m.regs[b+m.enable]==7 && m.regs[b+m.wait]==7);
+                assert(value==(1u<<24|1u<<16) && m.regs[b+m.enable]==m.command_mask && m.regs[b+m.wait]==m.command_mask);
                 m.pending=b;m.regs[b+m.status]=0;
                 for (unsigned c=0;c<3;++c) m.regs[b+m.msg+12+c*m.stride]=0;
             }
@@ -379,6 +380,20 @@ static void power() {
             assert(m.regs[at+4]==0x40800+(i==0?0:i==1?8:4));
             assert(m.regs[at+8]==(i==0?1800u:i==1?7u:1u));
         }
+        Rsc arc(major);arc.command_mask=3;auto arc_io=arc.io();
+        const rpmh_command commands[2]={{0x30010,4},{0x30020,3}};
+        assert(!sm8750_rpmh_write(&arc_io,commands,2,&result));
+        assert(result.command[0]==0x10100 && result.command[1]==0x10100 && result.command[2]==0);
+        assert(arc.regs[0xd00+arc.msg+4]==0x30010 && arc.regs[0xd00+arc.msg+8]==4);
+        assert(arc.regs[0xd00+arc.msg+arc.stride+4]==0x30020);
+        arc.writes.clear();const rpmh_command bad[1]={{0x30000,256}};
+        assert(sm8750_rpmh_write(&arc_io,bad,1,&result)==-22 && arc.writes.empty());
+        Rsc bcm(major);auto bcm_io=bcm.io();
+        const rpmh_command bandwidth[3]={{0x50010,0x20010004},{0x50020,0x60020008},{0x50030,0x60000004}};
+        assert(!sm8750_rpmh_write(&bcm_io,bandwidth,3,&result));
+        assert(bcm.regs[0xd00+bcm.msg+2*bcm.stride+8]==0x60000004);
+        bcm.writes.clear();const rpmh_command invalid_bcm[1]={{0x50010,0x80000000}};
+        assert(sm8750_rpmh_write(&bcm_io,invalid_bcm,1,&result)==-22 && bcm.writes.empty());
     }
     Rsc busy;auto io=busy.io();rpmh_result result={};busy.regs[0xd00+busy.control]=1;
     assert(!sm8750_rpmh_vrm_enable(&io,0x41900,3100,&result) && result.tcs==1);

@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+// Match the kernel function declarations when the host SDK fortifies stdio.
+#undef snprintf
+#undef vsnprintf
 #define BOOT_PROGRESS_TEST 1
 #ifndef T0SZ_BOOT
 #define T0SZ_BOOT 26
@@ -32,7 +35,7 @@ static thread_call_t thread_call_allocate_with_options(void (*fn)(void *, void *
 #define BOOT_LOGO_X 2
 #define BOOT_LOGO_Y -1
 static const unsigned char boot_logo[] = {0,64,128,255,255,128,64,0,0,64,128,255,255,128,64,0};
-static uint64_t test_cpu;
+static uint64_t test_cpu, test_ticks;
 unsigned processor_count, processor_avail_count;
 unsigned long gPhysSize;
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
@@ -54,6 +57,24 @@ volatile int native_owner_cache_stage;
 volatile uint64_t native_ufs_block_reads, native_ufs_block_failures;
 unsigned vm_page_free_count;
 uint32_t memorystatus_available_pages;
+volatile uint64_t native_gop_gpu_completions,native_gop_gpu_last_ns;
+static int test_gpu;
+static unsigned test_gpu_queries;
+int pagani_gpu_status(char lines[PAGANI_GPU_ROWS][PAGANI_STATUS_BYTES])
+{
+    ++test_gpu_queries;
+    if (!test_gpu) return 0;
+    snprintf(lines[0], PAGANI_STATUS_BYTES, "GPU GMU HFI rc=ffffffff");
+    if (test_gpu == 1) {
+        snprintf(lines[1], PAGANI_STATUS_BYTES, "M open=2 close=1 who=backboardd");
+        snprintf(lines[2], PAGANI_STATUS_BYTES, "CMD s=120 c=119 to=1 bad=0");
+        snprintf(lines[3], PAGANI_STATUS_BYTES, "API n=500 err=00000000 busy=0");
+        snprintf(lines[4], PAGANI_STATUS_BYTES, "CLK req=222MHz busy=1 SPactive=?/6");
+        snprintf(lines[5], PAGANI_STATUS_BYTES, "FR us A=12 S=34 E=56 Q=78 W=90 G=?");
+        snprintf(lines[6], PAGANI_STATUS_BYTES, "VSYNC SW=120.0/120Hz late=0");
+    }
+    return 1;
+}
 
 static void panic_for_test(const char *format, ...)
 {
@@ -65,7 +86,7 @@ static void panic_for_test(const char *format, ...)
 
 int main(void)
 {
-    enum { W = 126, H = 840, PITCH = 132, GUARD = 32 };
+    enum { W = 1260, H = 840, PITCH = 1267, GUARD = 32 };
     uint32_t *allocation = malloc((PITCH * H + 2 * GUARD) * sizeof(uint32_t));
     assert(allocation);
     for (unsigned i = 0; i < PITCH * H + 2 * GUARD; i++) allocation[i] = 0x12345678;
@@ -265,6 +286,7 @@ int main(void)
     boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));busy=0;
     boot_progress_peripheral(PAGANI_KEYS,"PMIC sample",0,0x8001,5);
+    test_ticks+=19200000/4;
     poll(NULL,NULL);
     assert(!memcmp(snapshot,allocation+GUARD,4*LINE*PITCH*sizeof(uint32_t)));
     assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,5*LINE*PITCH*sizeof(uint32_t)));
@@ -277,13 +299,82 @@ int main(void)
     boot_progress_peripheral_frame();
     assert(memcmp(snapshot+4*LINE*PITCH,allocation+GUARD+4*LINE*PITCH,2*LINE*PITCH*sizeof(uint32_t)));
     assert(!memcmp(snapshot+6*LINE*PITCH,allocation+GUARD+6*LINE*PITCH,(H-6*LINE)*PITCH*sizeof(uint32_t)));
+    test_gpu = 1; test_ticks = 19200000;
+    boot_progress_display_copy(1920000, 8 << 20);
+    boot_progress_display_copy(1920000, 8 << 20);
+    native_gop_gpu_completions=15;native_gop_gpu_last_ns=17000000;
+    memcpy(snapshot, allocation + GUARD, PITCH * H * sizeof(uint32_t));
+    boot_progress_peripheral_frame();
+    assert(!strcmp(display_rate_status, "DISP G=15.0fps/17.0 C=2.0/100.0 O=0.0 frame"));
+    assert(display_tenths(UINT64_MAX)==99999);
+    // Cached rasterization must match the original glyph at the same scale.
+    uint32_t first_glyph[12*SCALE][CELL];
+    for(unsigned y=0;y<12*SCALE;y++)
+        for(unsigned x=0;x<CELL;x++)first_glyph[y][x]=allocation[GUARD+(6*LINE+y)*PITCH+x];
+    glyph_pixels('G',0,6*LINE,0xffffffff);
+    for(unsigned y=0;y<12*SCALE;y++)
+        for(unsigned x=0;x<CELL;x++)assert(first_glyph[y][x]==allocation[GUARD+(6*LINE+y)*PITCH+x]);
+    assert(!memcmp(snapshot, allocation + GUARD, 4 * LINE * PITCH * sizeof(uint32_t)));
+    assert(memcmp(snapshot + 6 * LINE * PITCH, allocation + GUARD + 6 * LINE * PITCH,
+                  8 * LINE * PITCH * sizeof(uint32_t)));
+    assert(!memcmp(snapshot + 14 * LINE * PITCH, allocation + GUARD + 14 * LINE * PITCH,
+                   (H - 14 * LINE) * PITCH * sizeof(uint32_t)));
+    unsigned queries = test_gpu_queries;
+    memcpy(snapshot, allocation + GUARD, PITCH * H * sizeof(uint32_t));
+    test_ticks += 19200000 / 4 - 1;
+    boot_progress_peripheral_frame();
+    assert(test_gpu_queries == queries);
+    assert(!memcmp(snapshot, allocation + GUARD, PITCH * H * sizeof(uint32_t)));
+    // A later display frame may overwrite the overlay before its next sample.
+    allocation[GUARD + 6 * LINE * PITCH]=0x12345678;
+    boot_progress_peripheral_frame();
+    assert(test_gpu_queries==queries && !memcmp(snapshot, allocation+GUARD, PITCH*H*sizeof(uint32_t)));
+    ++test_ticks;
+    boot_progress_peripheral_frame();
+    assert(test_gpu_queries == queries + 1);
+    test_ticks += 19200000;
+    test_gpu = 2;
+    boot_progress_peripheral_frame();
+    assert(!strcmp(display_rate_status, "DISP G=0.0fps/17.0 C=0.0/100.0 O=0.0 frame"));
+    // Empty snapshots erase old counters instead of leaving a stale success on screen.
+    for (unsigned y = 7 * LINE; y < 13 * LINE; y++)
+        for (unsigned x = 0; x < W / CELL * CELL; x++)
+            if (y % LINE < 12 * SCALE) assert(allocation[GUARD + y * PITCH + x] == 0xff000000);
+    for (unsigned y = 4 * LINE; y < 14 * LINE; y++)
+        for (unsigned x = W; x < PITCH; x++) assert(allocation[GUARD + y * PITCH + x] == 0x12345678);
+    uint32_t first,rows;
+    boot_progress_overlay_rows(&first,&rows);assert(first==4*LINE && rows==10*LINE);
+    boot_progress_overlay_preserve(1);
+    boot_progress_peripheral_frame();assert(strstr(display_rate_status,"4Hz"));
+    queries=test_gpu_queries;overlay_ticks=987;
+    test_ticks+=19200000/4-1;
+    memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
+    boot_progress_peripheral_frame();
+    assert(test_gpu_queries==queries && overlay_ticks==987);
+    assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
+    ++test_ticks;boot_progress_peripheral_frame();assert(test_gpu_queries==queries+1);
+    // Preserved rows write only changed glyphs, including the 32-bit odd-pitch path.
+    allocation[GUARD+4*LINE*PITCH]=0x98765432;
+    memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
+    processor_count=9;test_ticks+=19200000/4;boot_progress_peripheral_frame();
+    assert(allocation[GUARD+4*LINE*PITCH]==0x98765432);
+    unsigned changed=0;
+    for(unsigned y=0;y<LINE;++y)for(unsigned x=CELL;x<W;++x) {
+        const unsigned offset=(4*LINE+y)*PITCH+x;
+        if(x>=8*CELL && x<9*CELL && y<12*SCALE)changed+=snapshot[offset]!=allocation[GUARD+offset];
+        else assert(snapshot[offset]==allocation[GUARD+offset]);
+    }
+    assert(changed);
+    boot_progress_overlay_preserve(0);
     panic_for_test("panic after system display handoff");
+    unsigned before_gpu_queries = test_gpu_queries;
     memcpy(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t));
     boot_progress_peripheral(PAGANI_KEYS,"must preserve panic",0,0,0);
     boot_progress_touch_spi(0,0,0,0,0,0);boot_progress_touch_smmu(0,0,0,0);
     boot_progress_touch_dma(0,0,0,0);boot_progress_touch_read(0,0,0,0,0,0,0,0);boot_progress_touch_power(0,0,0,0,0,0,0);
     boot_progress_touch_hid(0,0,0,0,0,0,0,0);boot_progress_peripheral_frame();
     assert(!memcmp(snapshot,allocation+GUARD,PITCH*H*sizeof(uint32_t)));
+    assert(test_gpu_queries == before_gpu_queries);
     assert(strstr(peripheral_status[PAGANI_KEYS],"PMIC sample"));
     assert(strstr(peripheral_status[PAGANI_SPI_FIFO],"in=4000/7fff out=8000/10000 mask=802"));
     free(snapshot);

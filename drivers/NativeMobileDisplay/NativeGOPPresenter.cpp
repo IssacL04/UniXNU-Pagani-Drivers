@@ -13,6 +13,10 @@ extern "C" {
 volatile uint32_t native_gop_ready,native_gop_failures;
 volatile uint64_t native_gop_transfers,native_gop_bytes,native_gop_physical,native_gop_virtual;
 volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gpu_failures,native_gop_gpu_abandoned;
+volatile uint64_t native_gop_gpu_last_ns;
+// Last completed frame: offer-to-delivery, dependency wait, encode/import, submit, completion wait, GPU timestamp duration.
+volatile uint32_t native_gop_gpu_timing_us[6]={0,0,0,0,0,UINT32_MAX};
+volatile uint64_t native_gop_gpu_maps,native_gop_gpu_map_hits;
 /* waitSwap: [0] calls, [1] timeouts, [2] the requested timeout of the last call (ms), [3] time the last timed-out call really waited (ns), [4] the shortest
  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
 volatile uint64_t native_gop_wait_stats[7];
@@ -21,6 +25,8 @@ bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
 void native_legacy_gpu_complete(void *display,int status);
+void native_legacy_overlay_rows(uint32_t *,uint32_t *);
+void native_legacy_overlay_preserve(int);
 }
 class NativeGOPClient;
 class NativeGOPPresenter;
@@ -36,16 +42,22 @@ class NativeGOPPresenter : public IOService {
     IOService *memorySource=nullptr;
     // GPU hand-off (sheng-fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
     bool gpuMode=false,gpuClient=false;
-    struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
+    task_t gpuTask=TASK_NULL;
+    struct {bool offered,delivered;uint64_t sequence,began,deliveredAt;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
             uint64_t stride;uint32_t width,height;} swap={};
     uint64_t swapSequence=0;
+    struct SurfaceMap {IOMemoryDescriptor *memory;IOMemoryMap *map;uint32_t id;};
+    SurfaceMap surfaces[6]{};
+    uint32_t mappingSequence=0;
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
-    IOReturn completeSwap(uint64_t sequence,int status);
-    void abandonSwap();
+    IOReturn completeSwap(task_t,uint64_t sequence,int status,const NGPCompleteTimed *timing=nullptr);
+    IOReturn overlay(task_t,NGPOverlay *);
+    void abandonSwap(task_t=TASK_NULL);
 public:
     void setMemorySource(IOService *source) {memorySource=source;}
     static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
     static IOMemoryDescriptor *handoffMemory();
+    static void handoffClose(task_t task) {if(gHandoff)gHandoff->abandonSwap(task);}
     bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 private:
     IOReturn transfer(task_t,const NGPPresent &,NGPTransfer *);
@@ -67,6 +79,7 @@ class NativeGOPClient : public IOUserClient {
     static IOReturn presentAction(OSObject *,void *,IOExternalMethodArguments *);
     static IOReturn waitAction(OSObject *,void *,IOExternalMethodArguments *);
     static IOReturn completeAction(OSObject *,void *,IOExternalMethodArguments *);
+    static IOReturn overlayAction(OSObject *,void *,IOExternalMethodArguments *);
 public:
     bool initWithTask(task_t,void *,UInt32,OSDictionary *) override;
     bool start(IOService *) override;
@@ -129,12 +142,13 @@ IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfe
 // The display driver offers a finished frame. Accepted only while the privileged GPU client is alive and waiting for work; otherwise the
 // display driver keeps its own path (counted by it as a fallback).
 bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
-    if(!gpuMode || !memory || !display || !gate)return false;
+    if(!gpuMode || !memory || !display || !gate || width!=mode.width || height!=mode.height ||
+       stride<mode.width*4 || stride>UINT64_MAX/height || memory->getLength()<stride*height)return false;
     IOLockLock(gate);
     bool accepted=online && gpuClient && !swap.offered;
     if(accepted) {
         memory->retain();
-        swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
+        swap={true,false,++swapSequence,mach_absolute_time(),0,display,memory,nullptr,stride,width,height};
         native_gop_gpu_offers=native_gop_gpu_offers+1;
         IOLockWakeup(gate,&swap,false);
     }
@@ -142,13 +156,16 @@ bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t
 }
 IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *out) {
     if(!gpuMode)return kIOReturnUnsupported;
+    if(!task || !out)return kIOReturnBadArgument;
     if(timeoutMs>1000)timeoutMs=1000;
     uint64_t deadline;clock_interval_to_deadline((uint32_t)timeoutMs,kMillisecondScale,&deadline);
     const uint64_t began=mach_absolute_time();
     native_gop_wait_stats[0]=native_gop_wait_stats[0]+1;native_gop_wait_stats[2]=timeoutMs;
     IOLockLock(gate);
+    if(gpuTask && gpuTask!=task) {IOLockUnlock(gate);return kIOReturnBusy;}
+    if(!gpuTask) {task_reference(task);gpuTask=task;}
     gpuClient=true;
-    while(online && (!swap.offered || swap.delivered)) {
+    while(online && gpuTask==task && (!swap.offered || swap.delivered)) {
         if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
             IOLockUnlock(gate);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
@@ -159,44 +176,83 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
             return kIOReturnTimeout;
         }
     }
-    if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
+    if(!online || gpuTask!=task) {IOLockUnlock(gate);return kIOReturnNotReady;}
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+    IOMemoryMap *map=nullptr;uint32_t mappingId=0;
+    for(const auto &entry:surfaces)if(entry.memory==memory) {
+        map=entry.map;map->retain();mappingId=entry.id;
+        __atomic_fetch_add(&native_gop_gpu_map_hits,1,__ATOMIC_RELAXED);break;
+    }
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
-    IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+    if(!map) {
+        map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+        if(map)__atomic_fetch_add(&native_gop_gpu_maps,1,__ATOMIC_RELAXED);
+    }
     memory->release();
     IOLockLock(gate);
-    if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence) {
-        IOLockUnlock(gate);OSSafeReleaseNULL(map);__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);return kIOReturnNoMemory;
+    if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence || gpuTask!=task) {
+        IOLockUnlock(gate);OSSafeReleaseNULL(map);__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);
+        abandonSwap(task);return kIOReturnNoMemory;
+    }
+    // shortcut: six retained mappings, use per-frame imports beyond that until the client acknowledges eviction.
+    if(!mappingId && mappingSequence!=UINT32_MAX)for(auto &entry:surfaces)if(!entry.memory) {
+        memory->retain();map->retain();mappingId=++mappingSequence;entry={memory,map,mappingId};break;
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
-    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
+    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=mappingId;
+    swap.deliveredAt=mach_absolute_time();
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
-IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
+IOReturn NativeGOPPresenter::completeSwap(task_t task,uint64_t sequence,int status,const NGPCompleteTimed *timing) {
     IOLockLock(gate);
-    if(!swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    if(task!=gpuTask || !swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
     auto done=swap;swap={};
     IOLockUnlock(gate);
     OSSafeReleaseNULL(done.map);done.memory->release();
     if(status)__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);
-    else native_gop_gpu_completions=native_gop_gpu_completions+1;
+    else {
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-done.began,&ns);
+        __atomic_store_n(&native_gop_gpu_last_ns,ns,__ATOMIC_RELAXED);
+        absolutetime_to_nanoseconds(done.deliveredAt-done.began,&ns);
+        const uint32_t values[6]={uint32_t(ns/1000>UINT32_MAX?UINT32_MAX:ns/1000),
+            timing?timing->sync_us:0,timing?timing->encode_us:0,timing?timing->submit_us:0,
+            timing?timing->wait_us:0,timing?timing->gpu_us:UINT32_MAX};
+        for(unsigned i=0;i<6;++i)__atomic_store_n(&native_gop_gpu_timing_us[i],values[i],__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_gop_gpu_completions,1,__ATOMIC_RELAXED);
+    }
     native_legacy_gpu_complete(done.display,status);return kIOReturnSuccess;
 }
 // The client went away with a frame outstanding: the display driver is told it failed, so it can use its own path instead of waiting forever.
-void NativeGOPPresenter::abandonSwap() {
+void NativeGOPPresenter::abandonSwap(task_t task) {
     if(!gate)return;
     IOLockLock(gate);
+    if(task && task!=gpuTask) {IOLockUnlock(gate);return;}
+    native_legacy_overlay_preserve(0);
     gpuClient=false;
+    task_t previous=gpuTask;gpuTask=TASK_NULL;
     auto done=swap;swap={};
-    IOLockUnlock(gate);
+    SurfaceMap retired[6];
+    for(unsigned i=0;i<6;++i) {retired[i]=surfaces[i];surfaces[i]={};}
+    IOLockWakeup(gate,&swap,false);IOLockUnlock(gate);
+    for(auto &entry:retired) {OSSafeReleaseNULL(entry.map);OSSafeReleaseNULL(entry.memory);}
+    if(previous)task_deallocate(previous);
     if(!done.offered)return;
     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
+}
+IOReturn NativeGOPPresenter::overlay(task_t task,NGPOverlay *out) {
+    if(!task || !out)return kIOReturnBadArgument;
+    IOLockLock(gate);
+    if(!online || (gpuTask && gpuTask!=task)) {IOLockUnlock(gate);return kIOReturnBusy;}
+    if(!gpuTask) {task_reference(task);gpuTask=task;}
+    native_legacy_overlay_rows(&out->first,&out->rows);
+    native_legacy_overlay_preserve(1);
+    IOLockUnlock(gate);return kIOReturnSuccess;
 }
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
@@ -212,6 +268,9 @@ IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,
     NativeGOPPresenter *p=gHandoff;
     if(!p || !p->gpuMode || !p->online)return kIOReturnNotReady;
     switch(op) {
+    case NGP_METHOD_OVERLAY:
+        if(inSize || !out || outSize!=sizeof(NGPOverlay))return kIOReturnBadArgument;
+        return p->overlay(task,static_cast<NGPOverlay *>(out));
     case NGP_METHOD_MODE:
         if(inSize || !out || outSize!=sizeof(NGPMode))return kIOReturnBadArgument;
         memcpy(out,&p->mode,sizeof(NGPMode));return kIOReturnSuccess;
@@ -222,9 +281,10 @@ IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,
         if(status==kIOReturnSuccess)memcpy(out,&swap,sizeof(swap));return status;
     }
     case NGP_METHOD_COMPLETE_SWAP: {
-        if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
-        NGPComplete q={};memcpy(&q,in,sizeof(q));
-        return p->completeSwap(q.sequence,(int)q.status);
+        if(!in || (inSize!=sizeof(NGPComplete) && inSize!=sizeof(NGPCompleteTimed)) || outSize)return kIOReturnBadArgument;
+        NGPCompleteTimed q={};memcpy(&q,in,inSize);
+        if(q.done.reserved || q.reserved)return kIOReturnBadArgument;
+        return p->completeSwap(task,q.done.sequence,(int)q.done.status,inSize==sizeof(q)?&q:nullptr);
     }
     default:return kIOReturnUnsupported;
     }
@@ -240,6 +300,7 @@ IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
 extern "C" IOReturn native_gop_handoff_call(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
     return NativeGOPPresenter::handoffCall(op,task,in,inSize,out,outSize);
 }
+extern "C" void native_gop_handoff_close(task_t task) {NativeGOPPresenter::handoffClose(task);}
 extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void) {return NativeGOPPresenter::handoffMemory();}
 IOReturn NativeGOPPresenter::newUserClient(task_t task,void *security,UInt32 type,OSDictionary *properties,IOUserClient **out) {
     if(!out || type)return kIOReturnBadArgument;
@@ -261,7 +322,7 @@ bool NativeGOPClient::start(IOService *provider) {
     opened=controller->open(this);return opened;
 }
 void NativeGOPClient::stop(IOService *provider) {
-    if(opened){if(controller)controller->abandonSwap();controller->close(this);opened=false;}controller=nullptr;IOUserClient::stop(provider);
+    if(opened){if(controller)controller->abandonSwap(task);controller->close(this);opened=false;}controller=nullptr;IOUserClient::stop(provider);
 }
 void NativeGOPClient::free() {if(task){task_deallocate(task);task=TASK_NULL;}IOUserClient::free();}
 IOReturn NativeGOPClient::modeAction(OSObject *target,void *,IOExternalMethodArguments *a) {
@@ -291,15 +352,22 @@ IOReturn NativeGOPClient::completeAction(OSObject *target,void *,IOExternalMetho
     if(!client || !client->opened || !client->controller)return kIOReturnNotOpen;
     if(a->structureInputDescriptor || a->structureOutputDescriptor || !a->structureInput)return kIOReturnUnsupported;
     NGPComplete q={};memcpy(&q,a->structureInput,sizeof(q));
-    return client->controller->completeSwap(q.sequence,(int)q.status);
+    return client->controller->completeSwap(client->task,q.sequence,(int)q.status);
 }
 IOReturn NativeGOPClient::externalMethod(uint32_t selector,IOExternalMethodArguments *a,IOExternalMethodDispatch *,OSObject *,void *) {
     static const IOExternalMethodDispatch methods[]={{modeAction,0,0,0,sizeof(NGPMode)},
                                                     {presentAction,0,sizeof(NGPPresent),0,sizeof(NGPTransfer)},
                                                     {waitAction,0,sizeof(NGPWait),0,sizeof(NGPSwap)},
-                                                    {completeAction,0,sizeof(NGPComplete),0,0}};
-    if(selector>=4)return kIOReturnUnsupported;
+                                                    {completeAction,0,sizeof(NGPComplete),0,0},
+                                                    {overlayAction,0,0,0,sizeof(NGPOverlay)}};
+    if(selector>=5)return kIOReturnUnsupported;
     return IOUserClient::externalMethod(selector,a,const_cast<IOExternalMethodDispatch *>(methods+selector),this,nullptr);
+}
+IOReturn NativeGOPClient::overlayAction(OSObject *target,void *,IOExternalMethodArguments *a) {
+    NativeGOPClient *client=OSDynamicCast(NativeGOPClient,target);
+    if(!client || !client->opened || !client->controller)return kIOReturnNotOpen;
+    if(a->structureInputDescriptor || a->structureOutputDescriptor || !a->structureOutput)return kIOReturnUnsupported;
+    return client->controller->overlay(client->task,static_cast<NGPOverlay *>(a->structureOutput));
 }
 IOReturn NativeGOPClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) {
     if(type>NGP_MEMORY_SCANOUT_RW || !options || !memory)return kIOReturnBadArgument;

@@ -61,6 +61,18 @@ static char timer_status[96];
 static char display_status[96];
 static char peripheral_status[PAGANI_PERIPHERALS][80];
 static int peripheral_overlay, platform_overlay;
+extern int pagani_gpu_status(char lines[PAGANI_GPU_ROWS][PAGANI_STATUS_BYTES]) __attribute__((weak));
+static uint64_t display_copies, display_copy_ticks, display_copy_bytes;
+static uint64_t display_sample_tick, display_sample_copies, display_fps10;
+extern volatile uint64_t native_gop_gpu_completions __attribute__((weak));
+extern volatile uint64_t native_gop_gpu_last_ns __attribute__((weak));
+static uint64_t display_sample_gpu, display_gpu_fps10, overlay_next_tick, overlay_ticks;
+enum { OVERLAY_ROWS = 2 + PAGANI_GPU_ROWS + 1, OVERLAY_WIDTH = PAGANI_STATUS_BYTES * CELL };
+static uint32_t overlay_pixels[OVERLAY_ROWS][12 * SCALE][OVERLAY_WIDTH] __attribute__((aligned(8)));
+static unsigned char overlay_chars[OVERLAY_ROWS][PAGANI_STATUS_BYTES], overlay_dirty[OVERLAY_ROWS][PAGANI_STATUS_BYTES];
+static unsigned overlay_rows, overlay_valid[OVERLAY_ROWS];
+static int overlay_preserved, overlay_painted;
+static char display_rate_status[PAGANI_STATUS_BYTES];
 extern unsigned processor_count, processor_avail_count;
 extern unsigned long gPhysSize;
 extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
@@ -139,6 +151,8 @@ static uint64_t counter(void)
     uint64_t value = 0;
 #ifndef BOOT_PROGRESS_TEST
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
+#else
+    value = test_ticks;
 #endif
     return value;
 }
@@ -457,24 +471,87 @@ void boot_progress_touch_smmu(uint32_t slot, uint32_t bank, uint32_t smr, uint32
 
 void boot_progress_peripheral_enable(int enabled)
 {
+    __atomic_store_n(&overlay_next_tick, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&peripheral_overlay, enabled != 0, __ATOMIC_RELEASE);
 }
 
 void boot_progress_platform_enable(int enabled)
 {
+    __atomic_store_n(&overlay_next_tick, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&platform_overlay, enabled != 0, __ATOMIC_RELEASE);
+}
+
+void boot_progress_display_copy(uint64_t ticks, uint64_t bytes)
+{
+    __atomic_store_n(&display_copy_ticks, ticks, __ATOMIC_RELAXED);
+    __atomic_store_n(&display_copy_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&display_copies, 1, __ATOMIC_RELAXED);
+}
+
+static unsigned display_tenths(uint64_t value)
+{
+    return value > 99999 ? 99999 : (unsigned)value;
+}
+
+void boot_progress_overlay_rows(uint32_t *first, uint32_t *rows)
+{
+    *first = *rows = 0;
+    if (panic_state) return;
+    unsigned count = platform_overlay ? 2U + (pagani_gpu_status ? PAGANI_GPU_ROWS + 1 : 0) :
+        (peripheral_overlay ? PAGANI_PERIPHERALS : 0);
+    if (count && (4 + count) * LINE <= height) { *first = 4 * LINE; *rows = count * LINE; }
+}
+
+void boot_progress_overlay_preserve(int enabled)
+{
+    __atomic_store_n(&overlay_painted, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&overlay_preserved, enabled != 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&overlay_next_tick, 0, __ATOMIC_RELAXED);
 }
 
 // Only the opted-in status rows may repaint after console handoff.
 void boot_progress_peripheral_frame(void)
 {
+    if (panic_state || __atomic_load_n(&panic_cpu, __ATOMIC_ACQUIRE)) return;
     int platform = __atomic_load_n(&platform_overlay, __ATOMIC_ACQUIRE);
     if (!platform && !__atomic_load_n(&peripheral_overlay, __ATOMIC_ACQUIRE)) return;
+    const uint64_t began = counter(), hz = frequency();
+    uint64_t next = __atomic_load_n(&overlay_next_tick, __ATOMIC_RELAXED);
+    const int sample = began >= next && __atomic_compare_exchange_n(&overlay_next_tick, &next,
+        began + (hz / 4 ? hz / 4 : 1), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    if (!sample && __atomic_load_n(&overlay_preserved, __ATOMIC_ACQUIRE)) return;
+    // Initialize explicitly so XNU's automatic stack clearing cannot emit bzero.
+    char gpu_lines[PAGANI_GPU_ROWS][PAGANI_STATUS_BYTES] __attribute__((uninitialized));
+    for (unsigned i = 0; i < sizeof(gpu_lines); i++) ((volatile char *)gpu_lines)[i] = 0;
+    // Query before disabling interrupts; the GPU snapshot itself never waits for its lock.
+    int gpu = sample && platform && pagani_gpu_status && pagani_gpu_status(gpu_lines);
     uint64_t flags = irq_save();
     if (flags == UINT64_MAX) return;
     if (!display_owned || panic_state || busy || !framebuffer) { irq_restore(flags); return; }
+    const int preserved = __atomic_load_n(&overlay_preserved, __ATOMIC_ACQUIRE);
+    const int partial = preserved && __atomic_load_n(&overlay_painted, __ATOMIC_RELAXED);
     char line[80];
-    for (unsigned i = 0; i < (platform ? 2U : PAGANI_PERIPHERALS); i++) {
+    if (sample && gpu) {
+        uint64_t tick = began;
+        uint64_t copies = __atomic_load_n(&display_copies, __ATOMIC_RELAXED);
+        uint64_t presents = &native_gop_gpu_completions ? __atomic_load_n(&native_gop_gpu_completions, __ATOMIC_RELAXED) : 0;
+        if (hz && tick - display_sample_tick >= hz) {
+            display_fps10 = (copies - display_sample_copies) * 10 * hz / (tick - display_sample_tick);
+            display_gpu_fps10 = (presents - display_sample_gpu) * 10 * hz / (tick - display_sample_tick);
+            display_sample_gpu = presents;
+            display_sample_tick = tick; display_sample_copies = copies;
+        }
+        uint64_t us = hz ? __atomic_load_n(&display_copy_ticks, __ATOMIC_RELAXED) * 1000000 / hz : 0;
+        uint64_t gpu_us = &native_gop_gpu_last_ns ? __atomic_load_n(&native_gop_gpu_last_ns, __ATOMIC_RELAXED) / 1000 : 0;
+        uint64_t ov_us = hz ? __atomic_load_n(&overlay_ticks, __ATOMIC_RELAXED) * 1000000 / hz : 0;
+        unsigned gf = display_tenths(display_gpu_fps10), cf = display_tenths(display_fps10);
+        unsigned gm = display_tenths(gpu_us / 100), cm = display_tenths(us / 100), om = display_tenths(ov_us / 100);
+        snprintf(display_rate_status, sizeof(display_rate_status), "DISP G=%u.%ufps/%u.%u C=%u.%u/%u.%u O=%u.%u %s",
+                 gf / 10, gf % 10, gm / 10, gm % 10, cf / 10, cf % 10, cm / 10, cm % 10, om / 10, om % 10,
+                 __atomic_load_n(&overlay_preserved, __ATOMIC_ACQUIRE) ? "4Hz" : "frame");
+    }
+    if (sample) overlay_rows = platform ? 2U + (gpu ? PAGANI_GPU_ROWS + 1 : 0) : PAGANI_PERIPHERALS;
+    for (unsigned i = 0; sample && i < overlay_rows; i++) {
         if (platform && i == 0) {
             unsigned timer = 0, ipi = 0;
             for (unsigned cpu = 0; cpu < 8; cpu++) {
@@ -483,20 +560,63 @@ void boot_progress_peripheral_frame(void)
             }
             snprintf(line, sizeof(line), "CPU reg=%u online=%u T=%02x I=%02x",
                      processor_count, processor_avail_count, timer, ipi);
-        } else if (platform) {
+        } else if (platform && i == 1) {
             snprintf(line, sizeof(line), "RAM MiB=%lu free=%u avail=%u", gPhysSize >> 20,
                      vm_page_free_count >> 8, memorystatus_available_pages >> 8);
+        } else if (platform && i < 2 + PAGANI_GPU_ROWS) {
+            copy_line(line, sizeof(line), gpu_lines[i - 2]);
+        } else if (platform) {
+            copy_line(line, sizeof(line), display_rate_status);
         } else copy_line(line, sizeof(line), peripheral_status[i]);
-        if (!line[0]) continue;
+        overlay_valid[i] = line[0] || gpu;
+        if (!overlay_valid[i]) continue;
         unsigned at = 0;
-        for (unsigned x = 0; x + CELL <= width; x += CELL) {
-            if (panic_state) { irq_restore(flags); return; }
-            unsigned char c = line[at];
-            if (c) at++;
-            glyph_pixels(c ? c : ' ', x, (i + 4) * LINE, 0xffffffff);
+        for (unsigned x = 0; x + CELL <= width && x + CELL <= OVERLAY_WIDTH; x += CELL) {
+            unsigned char c = line[at] ? line[at] : ' ';
+            if (line[at]) at++;
+            if (c < 32 || c > 126) c = '?';
+            overlay_dirty[i][x / CELL] = !partial || overlay_chars[i][x / CELL] != c;
+            overlay_chars[i][x / CELL] = c;
+            if (!overlay_dirty[i][x / CELL]) continue;
+            uint64_t bits = font[c - 32];
+            for (unsigned gy = 0; gy < 12; gy++) {
+                unsigned scan = (unsigned)((gy < 6 ? bits >> 32 : bits & 0xffffffff) >> ((gy % 6) * 5));
+                for (unsigned gx = 0; gx < 6; gx++) {
+                    uint32_t color = gx < 5 && (scan & (1U << gx)) ? 0xffffffff : 0xff000000;
+                    for (unsigned dy = 0; dy < SCALE; dy++)
+                        for (unsigned dx = 0; dx < SCALE; dx++) overlay_pixels[i][gy * SCALE + dy][x + gx * SCALE + dx] = color;
+                }
+            }
         }
     }
+    // Legacy clients overwrite the band; negotiated clients preserve it and need only the 4 Hz redraw.
+    unsigned columns = width / CELL * CELL;
+    if (columns > OVERLAY_WIDTH) columns = OVERLAY_WIDTH;
+    for (unsigned i = 0; i < overlay_rows; i++) {
+        if (!overlay_valid[i] || (i + 5) * LINE > height) continue;
+        for (unsigned y = 0; y < 12 * SCALE; y++) {
+            if (panic_state) { irq_restore(flags); return; }
+            volatile uint32_t *to = (volatile uint32_t *)framebuffer + ((i + 4) * LINE + y) * stride;
+            const uint32_t *from = overlay_pixels[i][y];
+            if ((uintptr_t)to & 7) {
+                for (unsigned x = 0; x < columns; x++)
+                    if (!partial || overlay_dirty[i][x / CELL]) to[x] = from[x];
+            } else {
+                for (unsigned x = 0; x < columns; x += 2)
+                    if (!partial || overlay_dirty[i][x / CELL])
+                        ((volatile uint64_t *)to)[x / 2] = (uint64_t)from[x] | ((uint64_t)from[x + 1] << 32);
+            }
+        }
+        if (preserved && !partial)
+            for (unsigned y = 0; y < LINE; y++) {
+                if (panic_state) { irq_restore(flags); return; }
+                volatile uint32_t *to = (volatile uint32_t *)framebuffer + ((i + 4) * LINE + y) * stride;
+                for (unsigned x = y < 12 * SCALE ? columns : 0; x < width; x++) to[x] = 0xff000000;
+            }
+    }
+    __atomic_store_n(&overlay_painted, preserved, __ATOMIC_RELAXED);
     barrier(); irq_restore(flags);
+    __atomic_store_n(&overlay_ticks, counter() - began, __ATOMIC_RELAXED);
 }
 
 static void panic_halt(void)
@@ -606,6 +726,13 @@ void early_boot_progress_init(boot_args *args)
     poll_count = 0; display_value = 0;
     display_stage[0] = 0; exit_stage[0] = 0;
     peripheral_overlay = 0; platform_overlay = 0;
+    display_copies = display_copy_ticks = display_copy_bytes = 0;
+    display_sample_tick = display_sample_copies = display_fps10 = 0;
+    display_sample_gpu = display_gpu_fps10 = overlay_next_tick = overlay_ticks = 0;
+    overlay_rows = 0;
+    overlay_preserved = 0;
+    overlay_painted = 0;
+    display_rate_status[0] = 0;
     for (unsigned i = 0; i < PAGANI_PERIPHERALS; i++) peripheral_status[i][0] = 0;
     boot_progress_panic_text[0] = 0;
     framebuffer = 0; column = 0; row = LOG_TOP; busy = 0;
