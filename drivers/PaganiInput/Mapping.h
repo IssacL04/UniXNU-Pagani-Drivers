@@ -6,9 +6,10 @@
 struct PeripheralWindow {
     IOMemoryMap *mapping=nullptr;
     volatile uint32_t *base=nullptr;
-    bool map(uint64_t address,unsigned size) {
+    // extra: further map options, kIOMapReadOnly for a window that only reads (a write through it faults).
+    bool map(uint64_t address,unsigned size,IOOptionBits extra=0) {
         IODeviceMemory *memory=IODeviceMemory::withRange(address,size);
-        mapping=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        mapping=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache|extra):nullptr;
         OSSafeReleaseNULL(memory);
         base=mapping?reinterpret_cast<volatile uint32_t *>(mapping->getVirtualAddress()):nullptr;
         return base!=nullptr;

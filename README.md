@@ -71,3 +71,7 @@ GPU 诊断候选在 `pagani-platform-status=1` 的 CPU/RAM 两行后增加 GPU �
 GPU 汇总候选在 A830 初始化、自检及服务注册成功后启动已有 NativeGOPPresenter，Metal 配置通过 `sheng-fb-gpu=1` 选择它。presenter 保留帧与映射至完成，并在映射失败或 handoff 客户端关闭时通知 CPU 回退；实际代码的归属、尺寸、完成和释放回归已通过。Run 78 完整内核/Metal 构建和本地镜像回读已通过；该路径尚未在 13T 上完成 GPU 呈现实测。
 
 NativeMobileDisplay 现可记录 GPU 帧的 offer、交付、完成和放弃，并在成功完成后读取既有扫描输出映射。像素采样默认关闭；开启后每次启动最多 3 份、间隔至少 30 秒，每份最多 64×64 个原始 BGRX 像素。采样记录不声称已发生硬件显示 latch；GPU 失败和映射越界不会触发采样。主机回归覆盖生命周期、失败路径、采样限额和像素内容，新增路径尚未实机验证。
+
+## OnePlus13T integration candidate (2026-11-04)
+
+Imported the public [Shad0w23333 snapshot](https://github.com/Shad0w23333/UniXNU-OnePlus13T/tree/3c514bc) into `drivers/Adreno830` and the existing Pagani components, preserving their licenses. It adds the Gen8 driver, DCVS/recovery, display pacing and mapping cache, CPU frequency governor, battery reporting and experimental peripherals. The device profile retains its own firmware pins, partition geometry and 4 GiB memory window. Existing Metal trace/pixel interfaces remain available. The author's hardware results in imported documents belong to that snapshot; this integration has not been booted.

@@ -184,8 +184,12 @@ static IOReturn hostNop (void)
   return kIOReturnSuccess;
 }
 
+#if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
+static bool hostLogCommand (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction, uint32_t dataBytes);
+#endif
+
 // Run a SCSI command. direction 0: no data, 1: host -> device from the DMA data area (already filled by the caller), 2: device
-// -> host into the DMA data area. Callers other than hostWrite4k never pass direction 1.
+// -> host into the DMA data area. Callers other than hostWrite4kHeld never pass direction 1.
 static IOReturn hostScsiDir (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction, uint32_t dataBytes,
                              uint32_t timeoutUs, uint32_t *scsiStatus)
 {
@@ -193,8 +197,9 @@ static IOReturn hostScsiDir (uint8_t lun, const uint8_t *cdb, unsigned cdbLength
   if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > kDataMax || direction > 2 ||
       (dataBytes & 3) || (dataBytes ? !direction : direction)) return kIOReturnBadArgument;
 #if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
-  if (direction == 1 || (cdb[0] != 0 && cdb[0] != 0x12 && cdb[0] != 0x25 && cdb[0] != 0x28 &&
-      !(cdbLength == 6 && cdb[0] == 0x1b && !cdb[1] && !cdb[2] && !cdb[3] && cdb[4] == 0x10 && !cdb[5])))
+  if ((direction == 1 || (cdb[0] != 0 && cdb[0] != 0x12 && cdb[0] != 0x25 && cdb[0] != 0x28 &&
+      !(cdbLength == 6 && cdb[0] == 0x1b && !cdb[1] && !cdb[2] && !cdb[3] && cdb[4] == 0x10 && !cdb[5]))) &&
+      !hostLogCommand (lun, cdb, cdbLength, direction, dataBytes))
     return kIOReturnBadArgument;
 #endif
   if (!hostClearUcd ()) return kIOReturnNotReady;
@@ -268,6 +273,13 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
   return kIOReturnSuccess;
 }
 
+// A command that outlives its timeout quarantines the one transport the root volume reads through, so these are long: a write that
+// waits blocks the reads for that long, a quarantine ends them for good. 30 s is what Linux gives a SCSI command. A read gets a write's
+// time while the log window is open: it can land behind a burst of writes the device is still moving from its cache to flash, and a read
+// that times out ends the root volume (rootDiagnosticFailure), the log's panic path with it.
+enum : uint32_t { kHostReadTimeoutUs = 1000000, kHostWriteTimeoutUs = 10000000, kHostSyncTimeoutUs = 30000000 };
+static bool gStoreOpen = false, gLogOpen = false;
+
 // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
@@ -279,7 +291,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
+  IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, gLogOpen ? kHostWriteTimeoutUs : kHostReadTimeoutUs, &scsi);
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
   }
@@ -291,12 +303,13 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
 // The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
 // each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
 // root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
-static bool gStoreOpen = false, gLogOpen = false;
+// A NATIVE_UFS_READ_ONLY image opens neither, with one exception: NATIVE_UFS_LOG_WRITES=1 (the 13T's kernel) opens the log window,
+// and hostLogCommand then lets exactly its WRITE(10) and SYNCHRONIZE CACHE(10) through hostScsiDir. The store stays closed.
 static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0;
 
 static bool hostLogOpen (uint64_t first, uint64_t blocks)
 {
-#if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
+#if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY && !(defined(NATIVE_UFS_LOG_WRITES) && NATIVE_UFS_LOG_WRITES)
   return false;
 #endif
   if (gLogOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
@@ -307,11 +320,42 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
   return true;
 }
 
+// The writer stopped for good (a write failed three times, or the GPT changed): nothing writes after this.
+static void hostLogClose (void)
+{
+  gLogOpen = false;
+  gLogFirst = gLogBlocks = 0;
+}
+
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
   return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
 }
+
+#if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
+// What hostScsiDir lets through a read-only image beside its reads: on LUN 0, with the log window open, a plain WRITE(10) of 4096-byte
+// blocks that lies inside the window (read back from the CDB, so a caller that skipped hostWrite4k's check meets the same test) and
+// SYNCHRONIZE CACHE(10) of the whole LUN without data. Nothing else writes: no other opcode, no flag bits, no FUA, no other LUN.
+static bool hostLogCommand (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction, uint32_t dataBytes)
+{
+#if defined(NATIVE_UFS_LOG_WRITES) && NATIVE_UFS_LOG_WRITES
+  if (!gLogOpen || lun || cdbLength != 10) return false;
+  if (direction == 1 && cdb[0] == 0x2a) {
+    const uint32_t blocks = (uint32_t (cdb[7]) << 8) | cdb[8];
+    return !cdb[1] && !cdb[6] && !cdb[9] && blocks && blocks <= kDataMax / 4096 && dataBytes == blocks * 4096U &&
+           hostInWindow (loadBe32 (cdb + 2), blocks);
+  }
+  if (direction == 0 && cdb[0] == 0x35 && !dataBytes) {
+    for (unsigned index = 1; index < 10; ++index) if (cdb[index]) return false;
+    return true;
+  }
+#else
+  (void) lun; (void) cdb; (void) cdbLength; (void) direction; (void) dataBytes;
+#endif
+  return false;
+}
+#endif
 
 static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 {
@@ -326,31 +370,50 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
   return true;
 }
 
-// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
-static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+static bool hostWriteAllowed (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
-    return kIOReturnBadArgument;
-  }
-  IOLockLock (gHost.lock);
+  return gHost.ready && src && blocks && blocks <= kDataMax / 4096 && !lun && hostInWindow (lba, blocks);
+}
+
+// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0. The caller holds gHost.lock, or owns the transport for good.
+static IOReturn hostWrite4kHeld (uint64_t lba, uint32_t blocks, const void *src, bool fua, uint32_t timeoutUs)
+{
+  // hostWriteAllowed ran before this thread had the lock: a command that timed out meanwhile leaves the DMA area to the controller (hostSubmit).
+  if (gHost.poisoned || !gHost.ready) return kIOReturnNotReady;
   gRootDiagnostic.lba = lba;
   memcpy (gHost.virt + kDataOffset, src, blocks * 4096U);
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsiDir (0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
+  return hostScsiDir (0, cdb, 10, 1, blocks * 4096U, timeoutUs, &scsi);
+}
+
+// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
+static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+{
+  if (!hostWriteAllowed (lun, lba, blocks, src)) {
+    return kIOReturnBadArgument;
+  }
+  IOLockLock (gHost.lock);
+  IOReturn status = hostWrite4kHeld (lba, blocks, src, fua, kHostWriteTimeoutUs);
   IOLockUnlock (gHost.lock);
   return status;
 }
 
-// SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
+// SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns. The caller holds gHost.lock,
+// or owns the transport for good.
+static IOReturn hostSyncCacheHeld (uint32_t timeoutUs)
+{
+  uint8_t cdb[10] = { 0x35 };
+  uint32_t scsi = 0;
+  return hostScsiDir (0, cdb, 10, 0, 0, timeoutUs, &scsi);
+}
+
 static IOReturn hostSyncCache (void)
 {
   if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
-  uint8_t cdb[10] = { 0x35 };
-  uint32_t scsi = 0;
-  IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
+  IOReturn status = hostSyncCacheHeld (kHostSyncTimeoutUs);
   IOLockUnlock (gHost.lock);
   return status;
 }

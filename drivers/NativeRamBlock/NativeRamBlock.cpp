@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -183,6 +184,19 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
+// On the device, before registerService: IOBlockStorageDriver::handleStart reads it from its provider, and DKIOCISSOLIDSTATE from the
+// parents of the media (of an APFS volume too), which is what picks XNU's 5/15/25 ms I/O throttle periods instead of the disk's 40/85/200
+// (the rest it changes: NativeUfs README).
+static void declareSolidState(IOService *device)
+{
+  OSDictionary *characteristics=OSDictionary::withCapacity(1);
+  OSString *medium=OSString::withCString(kIOPropertyMediumTypeSolidStateKey);
+  if(characteristics&&medium&&characteristics->setObject(kIOPropertyMediumTypeKey,medium))
+    device->setProperty(kIOPropertyDeviceCharacteristicsKey,characteristics);
+  OSSafeReleaseNULL(medium);
+  OSSafeReleaseNULL(characteristics);
+}
+
 bool NativeRamBlock::start(IOService *provider)
 {
   if (!IOBlockStorageDevice::start(provider)) return false;
@@ -243,6 +257,7 @@ bool NativeRamBlock::start(IOService *provider)
   native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
   online = true;
   native_ram_block_ready = 1;
+  declareSolidState(this);
   registerService();
   return true;
 }

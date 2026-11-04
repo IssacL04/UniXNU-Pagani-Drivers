@@ -32,6 +32,9 @@ int s3910_start(struct s3910 *);
 // 1 = complete frame, 0 = other report/idle, negative = protocol/transport failure.
 int s3910_poll(struct s3910 *, struct s3910_frame *);
 int s3910_decode(const uint8_t *, size_t, uint16_t, uint16_t, struct s3910_frame *);
+// Objects a contact report lists with any classification but "none" (fingers, gloves and the palms decode drops); 0 for a
+// malformed report.
+unsigned s3910_objects(const uint8_t *, size_t);
 void s3910_hid_report(const struct s3910_frame *, const struct s3910_frame *, uint8_t report[62]);
 #ifdef __cplusplus
 }

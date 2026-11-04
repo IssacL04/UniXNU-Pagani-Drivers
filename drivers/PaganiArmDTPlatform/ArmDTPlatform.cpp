@@ -3,7 +3,10 @@
 // Generic AArch64 Darwin platform expert for a supplied Apple-format device
 // tree. It derives from XNU's real IODTPlatformExpert and relies on the
 // platform's own DT root name ("device-tree") for matching. No board name,
-// SoC address or vendor identity is compiled into this source.
+// SoC address or vendor identity is compiled into this source; the default-off
+// calendar of the OnePlus 13T (pagani-rtc) keeps its addresses in PlatformRtc.h,
+// and its restart and power off (pagani-halt, PlatformHalt.h) go through
+// BootProgress.
 //
 // The DT must contain the nodes XNU's IODT platform path consumes:
 //   /chosen with a CHRP NVRAM proxy (nvram-bank-size, nvram-proxy-data)
@@ -13,11 +16,18 @@
 // a missing one; absent inputs make configure() fail.
 
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSIterator.h>
 #include <pexpert/pexpert.h>
+
+#include "PlatformHalt.h"
+#include "PlatformRtc.h"
 
 // Observation counters describe actual published nubs, not started drivers.
 extern "C" {
@@ -30,13 +40,34 @@ volatile uint32_t armdt_platform_nvram_proxy = 0;
 volatile uint32_t armdt_platform_device_count = 0;
 }
 
+// BootProgress's log and reset path. The defaults stand in on a kernel whose
+// BootProgress lacks them: nothing is logged, and haltRestart falls back on
+// the plain PSCI reset.
+extern "C" {
+void boot_progress_trace (const char *text);
+void ramoops_log_restart (const char *reason);
+void ramoops_log_power_off (const char *reason);
+__attribute__((weak)) void boot_progress_trace (const char *) {}
+__attribute__((weak)) void ramoops_log_restart (const char *) {}
+__attribute__((weak)) void ramoops_log_power_off (const char *) {}
+}
+
+static_assert (unsigned (PHALT_TYPE_HALT) == kPEHaltCPU && unsigned (PHALT_TYPE_RESTART) == kPERestartCPU &&
+               unsigned (PHALT_TYPE_UPS_HALT) == kPEUPSDelayHaltCPU &&
+               unsigned (PHALT_TYPE_PANIC_RESTART) == kPEPanicRestartCPU, "PlatformHalt.h follows IOPlatformExpert.h");
+
 class ArmDTPlatform : public IODTPlatformExpert {
   OSDeclareDefaultStructors (ArmDTPlatform)
 public:
+  bool start (IOService *provider) override;
   bool configure (IOService *provider) override;
   const char *deleteList (void) override;
   const char *excludeList (void) override;
+  int haltRestart (unsigned int type) override;
+  long getGMTTimeOfDay (void) override;
+  void setGMTTimeOfDay (long secs) override;
 private:
+  unsigned haltMode;
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
 };
@@ -109,7 +140,7 @@ bool ArmDTPlatform::createDeviceNubs (IOService *provider)
   return true;
 }
 
-static void platformStageReset (void)
+__attribute__((noreturn)) static void platformStageReset (void)
 {
   // PSCI SYSTEM_RESET via the same SMC conduit as the entry reset probe.
   register uint64_t x0 __asm__ ("x0") = 0x84000009;
@@ -118,6 +149,221 @@ static void platformStageReset (void)
   register uint64_t x3 __asm__ ("x3") = 0;
   __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
   for (;;) { __asm__ volatile ("wfe"); }
+}
+
+// ---- the calendar (pagani-rtc, PlatformRtc.h) ----
+namespace {
+struct RtcWindow {
+  IOMemoryMap *map;
+  volatile uint32_t *regs;
+};
+struct RtcState {
+  IOLock *lock;
+  PrtcClock clock;
+  RtcWindow core, cnfg, obs;
+  int apid;
+  bool enabled, resolved;
+};
+}
+
+static RtcState gRtc;
+
+static bool rtcMap (RtcWindow &window, uint64_t base, uint32_t bytes)
+{
+  IODeviceMemory *memory = IODeviceMemory::withRange (base, bytes);
+  window.map = memory ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  OSSafeReleaseNULL (memory);
+  window.regs = window.map ? reinterpret_cast<volatile uint32_t *> (window.map->getVirtualAddress ()) : nullptr;
+  return window.regs != nullptr;
+}
+
+static void rtcUnmap (RtcWindow &window)
+{
+  window.regs = nullptr;
+  OSSafeReleaseNULL (window.map);
+}
+
+static uint32_t rtcRead32 (const RtcWindow &window, uint32_t offset)
+{
+  const uint32_t value = window.regs[offset / 4];
+  __asm__ volatile ("dmb sy" ::: "memory");
+  return value;
+}
+
+static uint32_t rtcCore (void *, uint32_t offset) { return rtcRead32 (gRtc.core, offset); }
+static uint32_t rtcCnfg (void *, uint32_t offset) { return rtcRead32 (gRtc.cnfg, offset); }
+static uint32_t rtcObsRead (void *, uint32_t offset) { return rtcRead32 (gRtc.obs, offset); }
+
+static void rtcObsWrite (void *, uint32_t offset, uint32_t value)
+{
+  gRtc.obs.regs[offset / 4] = value;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void rtcDelay (void *, unsigned us) { IODelay (us); }
+
+static const PrtcIo gRtcIo = {nullptr, rtcCore, rtcCnfg, rtcObsRead, rtcObsWrite, rtcDelay};
+
+// The channel, once: the two table windows go again, the observer stays.
+// Under gRtc.lock.
+static void rtcResolve (void)
+{
+  gRtc.resolved = true;
+  gRtc.apid = PRTC_ENODEV;
+  if (rtcMap (gRtc.core, PRTC_CORE_BASE, PRTC_CORE_BYTES) && rtcMap (gRtc.cnfg, PRTC_CNFG_BASE, PRTC_CNFG_BYTES) &&
+      rtcMap (gRtc.obs, PRTC_OBS_BASE, PRTC_OBS_BYTES)) {
+    gRtc.apid = prtc_find (&gRtcIo, PRTC_PPID);
+  }
+  rtcUnmap (gRtc.core);
+  rtcUnmap (gRtc.cnfg);
+  if (gRtc.apid < 0) {
+    rtcUnmap (gRtc.obs);
+  }
+}
+
+// Under gRtc.lock.
+static int rtcRead (uint32_t *raw, uint8_t *control)
+{
+  if (!gRtc.resolved) {
+    rtcResolve ();
+  }
+  return gRtc.apid < 0 ? gRtc.apid : prtc_read_raw (&gRtcIo, gRtc.apid, raw, control);
+}
+
+static uint64_t rtcUptime (void)
+{
+  clock_sec_t seconds = 0;
+  clock_usec_t micros = 0;
+  clock_get_system_microtime (&seconds, &micros);
+  return seconds;
+}
+
+static void rtcLog (const char *what, int rc, uint32_t raw, uint8_t control, const PrtcClock &clock, int64_t utc)
+{
+  static const char *const from[] = {"none", "raw", "boot-arg", "floor", "set"};
+  char line[128];
+  snprintf (line, sizeof (line), "[rtc] %s rc %d raw %u ctl 0x%x apid %d offset %lld (%s) utc %lld", what, rc, raw, control,
+            gRtc.apid, clock.offset, from[clock.from], utc);
+  boot_progress_trace (line);
+}
+
+static int64_t rtcSeconds (void)
+{
+  uint32_t raw = 0;
+  uint8_t control = 0;
+  IOLockLock (gRtc.lock);
+  const int rc = rtcRead (&raw, &control);
+  const int64_t utc = prtc_clock_get (&gRtc.clock, rc == PRTC_OK, raw, rtcUptime ());
+  const PrtcClock clock = gRtc.clock;
+  IOLockUnlock (gRtc.lock);
+  rtcLog ("get", rc, raw, control, clock, utc);
+  return utc;
+}
+
+// A BCM2837 XNU does not wait for the platform expert before it starts the
+// calendar (IOKitInitializeTime compiles the IORTC wait out), and a read that
+// finds gIOPlatform unset gives 0. IOBSD is published after that read, so
+// from here on the calendar has either this clock's time or the uptime.
+static void rtcLateCheck (void *, wait_result_t)
+{
+  thread_set_thread_name (current_thread (), "pagani-rtc");
+  OSDictionary *matching = IOService::resourceMatching ("IOBSD");
+  if (matching == nullptr) {
+    return;
+  }
+  IOService *published = IOService::waitForMatchingService (matching);
+  OSSafeReleaseNULL (published);
+  OSSafeReleaseNULL (matching);
+  clock_sec_t seconds = 0;
+  clock_usec_t micros = 0;
+  clock_get_calendar_microtime (&seconds, &micros);
+  const int64_t utc = rtcSeconds ();
+  if (prtc_calendar_stale (seconds, utc)) {
+    clock_set_calendar_microtime (static_cast<clock_sec_t> (utc), 0);
+  }
+}
+
+// Runs before IOPlatformExpert::start makes this object gIOPlatform: from
+// then on the calendar can ask for the time.
+static void rtcStart (IOService *provider)
+{
+  unsigned enabled = 0;
+  PE_parse_boot_argn ("pagani-rtc", &enabled, sizeof (enabled));
+  if (enabled != 1) {
+    return;
+  }
+  gRtc.lock = IOLockAlloc ();
+  if (gRtc.lock == nullptr) {
+    return;
+  }
+  int64_t floor = 0;
+  IORegistryEntry *chosen = provider->childFromPath ("chosen", gIODTPlane);
+  if (chosen != nullptr) {
+    OSData *built = OSDynamicCast (OSData, chosen->getProperty ("pagani-build-time"));
+    if (built != nullptr) {
+      floor = prtc_floor (built->getBytesNoCopy (), built->getLength ());
+    }
+    chosen->release ();
+  }
+  int64_t offset = 0;
+  const bool haveOffset = PE_parse_boot_argn ("pagani-rtc-offset", &offset, sizeof (offset));
+  prtc_clock_start (&gRtc.clock, haveOffset, offset, floor);
+  gRtc.enabled = true;
+}
+
+long ArmDTPlatform::getGMTTimeOfDay (void)
+{
+  return gRtc.enabled ? rtcSeconds () : IODTPlatformExpert::getGMTTimeOfDay ();
+}
+
+// The offset in memory only: the RTC itself is never written.
+void ArmDTPlatform::setGMTTimeOfDay (long secs)
+{
+  if (!gRtc.enabled) {
+    IODTPlatformExpert::setGMTTimeOfDay (secs);
+    return;
+  }
+  uint32_t raw = 0;
+  uint8_t control = 0;
+  IOLockLock (gRtc.lock);
+  const int rc = rtcRead (&raw, &control);
+  prtc_clock_set (&gRtc.clock, rc == PRTC_OK, raw, rtcUptime (), secs);
+  const PrtcClock clock = gRtc.clock;
+  IOLockUnlock (gRtc.lock);
+  rtcLog ("set", rc, raw, control, clock, secs);
+}
+
+// ---- restart and power off (pagani-halt, PlatformHalt.h) ----
+int ArmDTPlatform::haltRestart (unsigned int type)
+{
+  const char *reason = nullptr;
+  const int action = pagani_halt_action (haltMode, type, &reason);
+  if (action == PHALT_INHERIT) {
+    return IODTPlatformExpert::haltRestart (type);
+  }
+  if (action == PHALT_POWER_OFF) {
+    ramoops_log_power_off (reason);
+  } else {
+    ramoops_log_restart (reason);
+  }
+  // Those do not return on a kernel that has them.
+  platformStageReset ();
+}
+
+bool ArmDTPlatform::start (IOService *provider)
+{
+  PE_parse_boot_argn ("pagani-halt", &haltMode, sizeof (haltMode));
+  rtcStart (provider);
+  if (!IODTPlatformExpert::start (provider)) {
+    return false;
+  }
+  if (gRtc.enabled) {
+    thread_t thread = THREAD_NULL;
+    if (kernel_thread_start (rtcLateCheck, nullptr, &thread) == KERN_SUCCESS) {
+      thread_deallocate (thread);
+    }
+  }
+  return true;
 }
 
 bool ArmDTPlatform::configure (IOService *provider)

@@ -1,0 +1,188 @@
+Proposed change (not applied): NativeUfs serves NativeRamBlock's persistent store from the iOS Data file in Android's /data
+(../PaganiPersistentData/DataFileUfs.h) when built with -DNATIVE_UFS_DATA_FILE=1 and booted with pagani-data-file=1|2.
+- RootCommands.h: hostInWindow also accepts DataFileUfs.h's verified data blocks (and the one REVOKED slot block while XNU revokes);
+  the read-only command filter lets WRITE(10)/SYNCHRONIZE CACHE(10) through only while dataFileWritesArmed(); hostSyncCache likewise.
+  Without NATIVE_UFS_DATA_FILE (and in probe-only builds) the file is unchanged in effect.
+- NativeUfs.cpp: includes the glue inside the transport namespace, records the lowest root window offset, routes
+  native_ufs_store_mode/open/read/write/sync to it while pagani-data-file is set, exports native_data_file_diag() for the boot page.
+Build: keep -DNATIVE_UFS_READ_ONLY=1, add -DNATIVE_UFS_DATA_FILE=1; PaganiPersistentData/ must sit next to NativeUfs/.
+Check: cd UniXNU-Pagani-Drivers && git apply --check drivers/PaganiPersistentData/integration/NativeUfs.patch
+
+--- a/drivers/NativeUfs/RootCommands.h
++++ b/drivers/NativeUfs/RootCommands.h
+@@ -184,6 +184,17 @@
+   return kIOReturnSuccess;
+ }
+ 
++// The iOS Data file in Android's /data (../PaganiPersistentData/DataFileUfs.h, included by NativeUfs.cpp after this file): its
++// verified data blocks and, while XNU revokes the file, one descriptor slot block of unixnu are the only other blocks a WRITE may
++// reach; the read-only build lets WRITE(10)/SYNCHRONIZE CACHE(10) through only while it holds a writable store.
++#if defined(NATIVE_UFS_DATA_FILE) && NATIVE_UFS_DATA_FILE && !(defined(NATIVE_UFS_PROBE_ONLY) && NATIVE_UFS_PROBE_ONLY)
++#define NATIVE_UFS_WITH_DATA_FILE 1
++static bool dataFileWriteAllowed (uint64_t lba, uint32_t blocks);
++static bool dataFileWritesArmed (void);
++#else
++#define NATIVE_UFS_WITH_DATA_FILE 0
++#endif
++
+ // Run a SCSI command. direction 0: no data, 1: host -> device from the DMA data area (already filled by the caller), 2: device
+ // -> host into the DMA data area. Callers other than hostWrite4k never pass direction 1.
+ static IOReturn hostScsiDir (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction, uint32_t dataBytes,
+@@ -193,8 +204,15 @@
+   if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > kDataMax || direction > 2 ||
+       (dataBytes & 3) || (dataBytes ? !direction : direction)) return kIOReturnBadArgument;
+ #if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
+-  if (direction == 1 || (cdb[0] != 0 && cdb[0] != 0x12 && cdb[0] != 0x25 && cdb[0] != 0x28 &&
+-      !(cdbLength == 6 && cdb[0] == 0x1b && !cdb[1] && !cdb[2] && !cdb[3] && cdb[4] == 0x10 && !cdb[5])))
++#if NATIVE_UFS_WITH_DATA_FILE
++  // hostWrite4k has already checked every block of the WRITE against the Data file (hostInWindow).
++  const bool dataFileCommand = dataFileWritesArmed () && cdbLength == 10 &&
++                               ((cdb[0] == 0x2a && direction == 1) || (cdb[0] == 0x35 && direction == 0));
++#else
++  const bool dataFileCommand = false;
++#endif
++  if (!dataFileCommand && (direction == 1 || (cdb[0] != 0 && cdb[0] != 0x12 && cdb[0] != 0x25 && cdb[0] != 0x28 &&
++      !(cdbLength == 6 && cdb[0] == 0x1b && !cdb[1] && !cdb[2] && !cdb[3] && cdb[4] == 0x10 && !cdb[5]))))
+     return kIOReturnBadArgument;
+ #endif
+   if (!hostClearUcd ()) return kIOReturnNotReady;
+@@ -309,6 +327,9 @@
+ 
+ static bool hostInWindow (uint64_t lba, uint32_t blocks)
+ {
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileWriteAllowed (lba, blocks)) return true;
++#endif
+   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
+   return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
+ }
+@@ -346,7 +367,11 @@
+ // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
+ static IOReturn hostSyncCache (void)
+ {
+-  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
++  bool armed = gStoreOpen || gLogOpen;
++#if NATIVE_UFS_WITH_DATA_FILE
++  armed = armed || dataFileWritesArmed ();
++#endif
++  if (!gHost.ready || !armed) return kIOReturnNotReady;
+   IOLockLock (gHost.lock);
+   uint8_t cdb[10] = { 0x35 };
+   uint32_t scsi = 0;
+--- a/drivers/NativeUfs/NativeUfs.cpp
++++ b/drivers/NativeUfs/NativeUfs.cpp
+@@ -911,6 +911,9 @@
+ #include "LunDiscovery.h"
+ #include "PartitionTable.h"
+ #include "NativeUfsPart.h"
++#if NATIVE_UFS_WITH_DATA_FILE
++#include "../PaganiPersistentData/DataFileUfs.h"
++#endif
+ 
+ static uint64_t gRootLunLast = UINT32_MAX;
+ static char gLunReport[512];
+@@ -1093,6 +1096,8 @@
+ };
+ StoreGeometry gStoreGeometry;
+ uint64_t gStoreRegionFirst, gStoreRegionBlocks;
++// The lowest root window offset (bytes into the root partition): the iOS Data file's descriptor slots must end below it.
++uint64_t gRootMinWindowOffset;
+ // The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
+ constexpr uint64_t kLogReserveBlocks = 8192;
+ // The log's export region: the 256 MiB just below the log window (the render server's pipeline caches, kits/sheng BootLog.c). It is
+@@ -1126,11 +1131,34 @@
+ }
+ }
+ 
+-extern "C" unsigned native_ufs_store_mode (void) { return storeMode (); }
++// With NATIVE_UFS_DATA_FILE, pagani-data-file=1|2 hands the store to the iOS Data file in Android's /data (DataFileUfs.h) instead of
++// the window at the end of the root partition; sheng-data-persist then plays no part.
++extern "C" unsigned native_ufs_store_mode (void)
++{
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileMode ()) return dataFileMode ();
++#endif
++  return storeMode ();
++}
+ 
+ // Returns 1 and the first absolute 4096-byte LBA of the window, 0 on refusal (reason in *why, may be null).
+ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const char **why)
+ {
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileMode ()) {
++    if (!gStoreGeometry.valid || !gHost.ready) {
++      if (why) *why = "no root layout";
++      return 0;
++    }
++    const DataFileRoot root = { gStoreGeometry.first, gStoreGeometry.last, gStoreGeometry.imageBytes, gRootMinWindowOffset,
++                                reserveBlocks () };
++    const int opened = dataFileStoreOpen (blocks, root, firstLba, why);
++    IOLog ("NativeUfs: Data file %s (mode %u, generation %llu, %llu extents, %llu segments, %llu canaries checked, %llu bad)\n",
++           opened ? "open" : why && *why ? *why : "refused", dataFileMode (), gDataFileDiag.generation, gDataFileDiag.extents,
++           gDataFileDiag.segments, gDataFileDiag.checked, gDataFileDiag.bad);
++    return opened;
++  }
++#endif
+   const char *reason = "";
+   int ok = 0;
+   if (!storeMode ()) reason = "off";
+@@ -1161,6 +1189,9 @@
+ 
+ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
+ {
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileMode ()) return dataFileStoreRead (rel, blocks, dst);
++#endif
+   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
+   while (blocks) {
+     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+@@ -1174,6 +1205,9 @@
+ 
+ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void *src)
+ {
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileMode ()) return dataFileStoreWrite (rel, blocks, src);
++#endif
+   if (storeMode () != 2 || !gStoreRegionBlocks || !src || !blocks || rel >= gStoreRegionBlocks ||
+       blocks > gStoreRegionBlocks - rel) return 0;
+   while (blocks) {
+@@ -1189,9 +1223,29 @@
+ 
+ extern "C" int native_ufs_store_sync (void)
+ {
++#if NATIVE_UFS_WITH_DATA_FILE
++  if (dataFileMode ()) return dataFileStoreSync ();
++#endif
+   return storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+ }
+ 
++#if NATIVE_UFS_WITH_DATA_FILE
++// The iOS Data file's state for the boot page (weak import there): mode, state (0 off, 1 read-only, 2 read-write, 3 refused,
++// 4 poisoned), error (DF_ERR_*), slot, generation, extents, segments, capacity, window, canaries checked, canaries bad, first bad
++// segment, reads, writes, gate refusals, read-back mismatches, self-tested blocks, canary scan ticks, revoked generation.
++// Returns how many values it wrote (at most n).
++extern "C" unsigned native_data_file_diag (uint64_t *out, unsigned n)
++{
++  const DataFileDiag &d = gDataFileDiag;
++  const uint64_t v[] = { d.mode, d.state, d.error, d.slot, d.generation, d.extents, d.segments, d.capacity, d.window, d.checked,
++                         d.bad, d.firstBad, d.reads, d.writes, d.gateRefusals, d.mismatches, d.selftested, d.scanTicks,
++                         d.revokedGeneration };
++  unsigned i = 0;
++  for (; out && i < n && i < sizeof (v) / sizeof (v[0]); ++i) out[i] = v[i];
++  return i;
++}
++#endif
++
+ // ---- Diagnostic log window (sheng-log=1) --------------------------------------------------------------------------
+ // The board's log writer (kits/sheng BootLog.c) gets the last kLogReserveBlocks of userdata and the kExportBlocks below them, refused
+ // unless the partition holds them clear of the flashed root image plus a 4 MiB guard. Off without the boot argument.
+@@ -1979,6 +2033,9 @@
+   }
+   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
+                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
++  gRootMinWindowOffset = UINT64_MAX;
++  for (unsigned i = 0; i < layout->windows; ++i)
++    if (layout->window[i].offset < gRootMinWindowOffset) gRootMinWindowOffset = layout->window[i].offset;
+   const char *names[4] = {};
+   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
+   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PaganiAudio</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.unixnu.pagani.audio</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PaganiAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>A2DED124-FF38-44E4-B352-70AF95CDBDAD</key>
+		<string>PaganiAudio_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>A2DED124-FF38-44E4-B352-70AF95CDBDAD</string>
+		</array>
+	</dict>
+	<key>MinimumOSVersion</key>
+	<string>17.0</string>
+</dict>
+</plist>

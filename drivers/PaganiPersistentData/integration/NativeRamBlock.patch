@@ -1,0 +1,117 @@
+Proposed change (not applied): a big (> 2 GiB) Data disk keeps working without a read-write store. Its writes go to RAM pages
+(../PaganiPersistentData/BigVolatile.h, limit pagani-data-volatile-mib, default 1024) over the store's pages when a read-only overlay
+holds them, else the seed: the fallback when the store is off/refused/failed, and the read-only verification boot (store mode 1).
+Also fixes mode 1 over a resumed store for a big disk, which reached the Loader and dereferenced sparse.pages (null for big disks).
+Small (<= 2 GiB) disks and the read-write direct path are unchanged.
+Check: cd UniXNU-Pagani-Drivers && git apply --check drivers/PaganiPersistentData/integration/NativeRamBlock.patch
+
+--- a/drivers/NativeRamBlock/NativeRamBlock.cpp
++++ b/drivers/NativeRamBlock/NativeRamBlock.cpp
+@@ -18,6 +18,7 @@
+ #include "SparseDisk.h"
+ #include "PersistOverlay.h"
+ #include "DirectDisk.h"
++#include "../PaganiPersistentData/BigVolatile.h"
+ 
+ extern "C" {
+ extern unsigned long gPhysBase, gPhysSize;
+@@ -44,6 +45,9 @@
+ volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0, native_data_persist_writes = 0,
+                   native_data_persist_syncs = 0, native_data_persist_errors = 0, native_data_persist_first_lba = 0,
+                   native_data_persist_present = 0;
++// A big disk without a read-write store keeps its writes in RAM (BigVolatile.h): the byte limit (pagani-data-volatile-mib, default
++// 1024) and what it holds now.
++volatile uint64_t native_data_volatile_limit = 0, native_data_volatile_bytes = 0;
+ }
+ 
+ class NativeRamBlock : public IOBlockStorageDevice {
+@@ -71,6 +75,37 @@
+     bool sync() { return native_ufs_store_sync(); }
+   };
+   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
++  // A big disk whose store is off, refused, failed or open read-only (the verification boot): writes go to RAM pages (BigVolatile.h),
++  // up to a limit; every other page is the store's when the overlay holds it, else the seed's, else zero. Nothing reaches the store.
++  // Without it such a disk failed every write, and a read-only resumed store reached the Loader, which needs sparse.pages.
++  BigVolatile bigRam;
++  bool bigRamOn = false;
++  struct BigRamOps {
++    uint8_t *allocate() { return static_cast<uint8_t *>(IOMallocZero(4096)); }
++    void release(uint8_t *p) { IOFree(p, 4096); }
++    void **table(uint64_t n) { return static_cast<void **>(IOMallocZero(n * sizeof(void *))); }
++    void untable(void **t, uint64_t n) { IOFree(t, n * sizeof(void *)); }
++  };
++  struct BigRamBase {
++    NativeRamBlock *self;
++    bool page(uint64_t i, uint8_t *dst) {
++      if (self->overlay.active && self->overlay.has(i)) { StoreOps s; return s.read(persist::pageBlock(self->overlay.pages, i), 1, dst); }
++      const uint8_t *p = self->big.find(i);
++      if (p) memcpy(dst, p, 4096); else bzero(dst, 4096);
++      return true;
++    }
++  };
++  void startBigRam() {
++    if (!isBig || direct || bigRamOn) return;
++    uint32_t mib = 1024;
++    if (!PE_parse_boot_argn("pagani-data-volatile-mib", &mib, sizeof mib) || !mib || mib > 4096) mib = 1024;
++    if (!stage) stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
++    BigRamOps ops;
++    bigRamOn = stage && bigRam.init(big.bytes / 4096, uint64_t(mib) << 20, ops);
++    native_data_volatile_limit = bigRamOn ? uint64_t(mib) << 20 : 0;
++    IOLog("NativeRamBlock: big Data disk %s (%u MiB of RAM for writes, store state %u)\n", bigRamOn ? "volatile" : "without RAM layer",
++          mib, native_data_persist_state);
++  }
+ public:
+   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
+   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
+@@ -113,6 +148,9 @@
+           // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
+           direct = true;
+           native_data_persist_state = 2;
++        } else if (isBig) {
++          // Resumed read-only, big disk: nothing is copied; BigVolatile reads the window for every page whose bit is set.
++          native_data_persist_state = 6;
+         } else {
+           struct Loader {
+             NativeRamBlock *self;
+@@ -143,6 +181,7 @@
+         native_data_persist_gpt_after = native_ufs_store_gpt_check();
+       }
+     }
++    startBigRam();
+     IOLockUnlock(gate);
+   }
+ 
+@@ -258,6 +297,25 @@
+   IOLockLock(gate);
+   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+   uint64_t actual;bool noMemory=false;
++  if(isBig && !direct && bigRamOn) {
++    struct BigBuf {
++      IOMemoryDescriptor *buffer;
++      uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
++      uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
++    } bb={buffer};
++    BigRamBase base={this};BigRamOps ops;
++    bool write=buffer->getDirection()==kIODirectionOut;
++    actual=bigVolatileIO(bigRam,base,ops,stage,write,block*512,bytes,bb,&noMemory);
++    if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
++    else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
++    native_data_volatile_bytes=bigRam.resident;
++    native_ram_block_resident_bytes=big.resident+bigRam.resident;
++    IOReturn bigStatus=actual==bytes?kIOReturnSuccess:noMemory?kIOReturnNoMemory:kIOReturnIOError;
++    if(bigStatus)__atomic_fetch_add(&native_ram_block_failures,1,__ATOMIC_RELAXED);
++    IOLockUnlock(gate);
++    completion->action(completion->target,completion->parameter,bigStatus,actual);
++    return kIOReturnSuccess;
++  }
+   if(isBig && !direct) {
+     // Before the store is attached (APFS probes the disk for its volume UUID long before the kernel asks for the Data volume, which is what
+     // attaches the store) a disk this size is read from its seed alone; it has no volatile mode, so writes wait.
+@@ -348,6 +406,7 @@
+ 
+ void NativeRamBlock::free()
+ {
++  if (bigRamOn) { BigRamOps ops; bigRam.release(ops); bigRamOn = false; }
+   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
+   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
+   if (isBig) {

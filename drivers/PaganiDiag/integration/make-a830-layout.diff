@@ -1,0 +1,72 @@
+--- a/工具/make-a830-layout.sh	2026-10-31 11:44:19
++++ b/工具/make-a830-layout.sh	2026-10-31 11:44:19
+@@ -33,12 +33,11 @@
+ # Every variant carries the time of this build as /chosen/pagani-build-time (Unix seconds, u32; A830_BUILD_TIME=<seconds> replaces it):
+ # PaganiArmDTPlatform's calendar starts there with boot-arg pagani-rtc=1 and no pagani-rtc-offset, and it is read only then.
+ # A830_DIAG=<dir> adds the PaganiDiag daemon (UniXNU-Pagani-Drivers drivers/PaganiDiag, scripts/build-paganidiag.py output) to the
+-# phone-plus/phone-apps seed (make-phone-seed.py --diag-daemon); the owner trust bundle must carry its CDHash (A830_OWNER_TRUST=
+-# <dir>/owner-trust-apps-diag.bundle from scripts/make-diag-trust.py; checked below). The kernel needs phone-diag-sysctl.patch, which
+-# starts the daemon in place of DumpPanic when the seed has it (A830_EXTRA_ARGS=pagani-diag=0 keeps it off), and the image gets
+-# boot-arg sheng-no-lc=1: launchd spawns that job as a system service (launch type 1), and AMFI's system-service launch policy
+-# refuses an owner-trusted binary from the Data volume (zzyc-owner-skip-launch-constraints.patch); A830_EXTRA_ARGS=sheng-no-lc=0
+-# overrides it (the last value wins).
++# phone-plus/phone-apps seed (make-phone-seed.py --diag-daemon) and boot-arg pagani-diag=1, which turns it on; the owner trust bundle
++# must carry its CDHash (A830_OWNER_TRUST=<bundle> from scripts/make-diag-trust.py; checked below). With A830_PREBUILT_SEED the seed
++# already carries the daemon (scripts/replace-diag-in-seed.py): A830_DIAG=1 adds the boot-arg, the CDHash comes from the seed's .json.
++# The kernel needs phone-diag-sysctl.patch, which starts the daemon in place of DumpPanic and lets the daemon's own image, and only
++# that, past the launch constraints, so the image needs no sheng-no-lc=1 and differs from a daily one by the daemon alone.
+ # A830_BATTERY=1 adds boot-arg pagani-battery=1 to the phone-plus/phone-apps forms (17 bytes of the command line):
+ # PaganiBattery, a default-off kernel component, then shows the fuel gauge's charge without the ADSP (pagani-adsp stays unset).
+ # A830_SENSORS=N adds boot-arg pagani-sensors=N (17 bytes): PaganiSensors, a default-off kernel component; 1 publishes the iOS sensor
+@@ -65,7 +64,7 @@
+ case "$SEED_NAME" in /*) BASE_SEED=$SEED_NAME ;; *) BASE_SEED=$B/$SEED_NAME ;; esac
+ # A relative A830_OWNER_TRUST means the caller's directory: the payload and boot image steps below run in UniXNU/.
+ case "${A830_OWNER_TRUST:-}" in ''|/*) ;; *) A830_OWNER_TRUST=$PWD/$A830_OWNER_TRUST ;; esac
+-case "${A830_DIAG:-}" in ''|/*) ;; *) A830_DIAG=$PWD/$A830_DIAG ;; esac
++case "${A830_DIAG:-}" in ''|/*|1) ;; *) A830_DIAG=$PWD/$A830_DIAG ;; esac
+ 
+ # A830_PREBUILT_SEED=<seed .dbrdisk> takes a phone seed this script made before (with its .json beside it) instead of making one
+ # from the base seed, with A830_OWNER_TRUST=<the bundle made with it>; with A830_AUDIO=1 that seed already carries the audio plug-in
+@@ -75,7 +74,7 @@
+     { [ "$VARIANT" = phone-plus ] || [ "$VARIANT" = phone-apps ]; } || { echo "make-a830-layout: A830_PREBUILT_SEED is for the phone forms" >&2; exit 1; }
+     [ -f "$A830_PREBUILT_SEED" ] && [ -f "${A830_PREBUILT_SEED%.dbrdisk}.json" ] || { echo "make-a830-layout: no seed or .json at $A830_PREBUILT_SEED" >&2; exit 1; }
+     [ -f "${A830_OWNER_TRUST:-}" ] || { echo "make-a830-layout: A830_PREBUILT_SEED needs A830_OWNER_TRUST" >&2; exit 1; }
+-    [ -n "${A830_DIAG:-}" ] && { echo "make-a830-layout: A830_DIAG cannot be added to a prebuilt seed" >&2; exit 1; }
++    case "${A830_DIAG:-}" in ''|1) ;; *) echo "make-a830-layout: a prebuilt seed carries the daemon already (replace-diag-in-seed.py): A830_DIAG=1" >&2; exit 1 ;; esac
+     SEED=$A830_PREBUILT_SEED
+     [ "${A830_AUDIO:-0}" = 1 ] && AUDIO_TRUST=$A830_OWNER_TRUST
+ fi
+@@ -105,6 +104,7 @@
+         [ "${A830_KEYBOARD_PREFS:-1}" != 0 ] && KEYBOARD+=(--keyboard-prefs)
+     fi
+     DIAG=()
++    [ "${A830_DIAG:-}" = 1 ] && { echo "make-a830-layout: A830_DIAG=1 is for A830_PREBUILT_SEED; a seed made here takes A830_DIAG=<dir>" >&2; exit 1; }
+     [ -n "${A830_DIAG:-}" ] && DIAG=(--diag-daemon "$A830_DIAG")
+     # The Control Center module sizes of the iPhone identity (phone-controlcenter-settings.patch): DefaultModuleSettings~iphone.plist
+     # that 工具/make-phone-controlcenter-overlay.py derives from the OS volume's ~ipad one; without it every module is drawn 1x1.
+@@ -278,8 +278,8 @@
+     1|2|3) KARGS+=(--kernel-arg "pagani-sensors=$A830_SENSORS") ;;
+     *) echo 'make-a830-layout: A830_SENSORS takes 0, 1, 2 or 3' >&2; exit 1 ;;
+ esac
+-# PaganiDiag runs in place of the system service com.apple.DumpPanic: no launch constraints for it (header above).
+-[ -n "${A830_DIAG:-}" ] && KARGS+=(--kernel-arg sheng-no-lc=1)
++# PaganiDiag is off without this argument, also in a seed that carries it (header above).
++[ -n "${A830_DIAG:-}" ] && KARGS+=(--kernel-arg pagani-diag=1)
+ for arg in ${A830_EXTRA_ARGS:-}; do KARGS+=(--kernel-arg "$arg"); done
+ # XNU takes the last value of a repeated option, so the earlier ones only cost bytes of the command line.
+ UNIQUE_KARGS=()
+@@ -330,8 +330,12 @@
+ EOF2
+ # The PaganiDiag daemon in the seed runs only with its CDHash in the owner trust bundle.
+ if [ -n "${A830_DIAG:-}" ] && { [ "$VARIANT" = phone-plus ] || [ "$VARIANT" = phone-apps ]; }; then
+-    python3 -c 'import json, sys; c = json.load(open(sys.argv[1]))["cdhash"]; sys.exit(0 if bytes.fromhex(c) in open(sys.argv[2], "rb").read() else f"make-a830-layout: PaganiDiag {c} is not in {sys.argv[2]} (set A830_OWNER_TRUST)")' \
+-        "$A830_DIAG/trust.json" "$OWNER"
++    python3 - "$A830_DIAG" "${SEED%.dbrdisk}.json" "$OWNER" <<'EOF3'
++import json, sys
++c = json.load(open(sys.argv[2]))['diag_daemon']['cdhash'] if sys.argv[1] == '1' else json.load(open(sys.argv[1] + '/trust.json'))['cdhash']
++if bytes.fromhex(c) not in open(sys.argv[3], 'rb').read():
++    sys.exit(f'make-a830-layout: PaganiDiag {c} is not in {sys.argv[3]} (set A830_OWNER_TRUST)')
++EOF3
+ fi
+ ./unixnu payload -D $DEV --out out-gpu --kernel $K --data-ramdisk "$SEED" --owner-trust-cache "$OWNER" "${KARGS[@]}" \
+     > "$LOGS/$NAME-payload.log" 2>&1

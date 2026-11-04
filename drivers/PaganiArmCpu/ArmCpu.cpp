@@ -6,6 +6,12 @@
 #include <libkern/c++/OSSymbol.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IOLib.h>
+#include <mach/processor_info.h>
+#include "ArmCpuSpiGate.h"
+#include "CpuFreqGovernor.h"
+#include "PsciIdle.h"
+#include "../BootProgress/PeripheralStatus.h"
 
 // Exact private entry from Darwin 23 arm/rtclock.h. Its full data header is
 // not exported to IOKit; the IRQ path calls the real kernel implementation.
@@ -18,6 +24,43 @@ extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), 
 extern "C" void thread_deallocate (thread_t);
 extern "C" thread_t current_thread (void);
 extern "C" kern_return_t thread_terminate (thread_t);
+// pagani-cpufreq: the scheduler's per-processor idle ticks (osfmk/kern/processor.c processor_info, PROCESSOR_CPU_LOAD_INFO counts the
+// recount idle time in hz_tick_interval units of mach time) and the thread's name.
+extern "C" kern_return_t processor_info (processor_t, processor_flavor_t, host_t *, processor_info_t, mach_msg_type_number_t *);
+extern "C" processor_t cpu_to_processor (int);
+extern "C" uint32_t hz_tick_interval;
+extern "C" void thread_set_thread_name (thread_t, const char *);
+// pagani-cpufreq's launch boost: the execs of an app or extension bundle (phone-app-exec-count.patch), what begins one, and XNU's process
+// identity version, one more at every fork (bsd/kern/kern_fork.c forkproc) and every exec (bsd/kern/kern_exec.c exec_handle_sugid), what
+// renews one. Lock-free reads.
+extern "C" int pagani_app_execs;
+extern "C" int nextpidversion;
+extern "C" void pagani_cpufreq_boost (void);
+// Weak defaults for builds without the other drivers (the statically linked kernel refuses undefined weak references): BootProgress's
+// CPU status row, its persistent log and stage history, PaganiInput's touch frame counter (also defined weak by the A830 DCVS) and the
+// GPU driver's two governor inputs (Adreno830's A830Dcvs.cpp defines both): adreno830_cpu_hint, a free-running count of accepted GPU
+// submissions, and adreno830_thermal_state, the hottest GPU sensor in deci-C with its flags (cpufreq::kGpuHeat*: a usable reading,
+// the GPU held below its top by its thermal loop, its 95 C emergency). Both are lock-free reads.
+extern "C" {
+void boot_progress_stage (const char *);
+uint32_t adreno830_cpu_hint (void);
+int32_t adreno830_thermal_state (uint32_t *flags);
+__attribute__((weak)) void boot_progress_cpu_row (const char *) {}
+__attribute__((weak)) void boot_progress_trace (const char *) {}
+__attribute__((weak)) void boot_progress_stage (const char *) {}
+__attribute__((weak)) volatile uint32_t pagani_input_touch_events;
+// pagani-screenoff bit 0 (CpuFreqGovernor.h, screen off): the display's power as PaganiPanel publishes it from the display's power
+// callback (bit 0 off, the count of changes above it) and PaganiInput's key report counter. Weak zero words like the touch counter:
+// the kernel link keeps one word each, and without those drivers the screen reads as on and no key is ever pressed.
+__attribute__((weak)) volatile uint32_t pagani_screen_state;
+__attribute__((weak)) volatile uint32_t pagani_input_key_events;
+__attribute__((weak)) uint32_t adreno830_cpu_hint (void) { return 0; }
+__attribute__((weak)) int32_t adreno830_thermal_state (uint32_t *flags)
+{
+  if (flags != nullptr) { *flags = 0; }
+  return 0;
+}
+}
 
 extern "C" {
 volatile uint32_t armcpu_registered = 0;
@@ -171,6 +214,491 @@ extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
 }
+
+// CPU performance levels over SCMI (boot-arg pagani-cpufreq; CpuFreqGovernor.h says what each mode does, ScmiPerf.h how the messages
+// travel). Absent or 0: nothing here runs, no window is mapped. Otherwise one kernel thread does everything: it maps the CPUCP mailbox
+// windows and the SCMI shared memory, describes both performance domains, then holds the top level (1) or runs the governor (2), and
+// shows the CPU row (BootProgress row 14). All SCMI use holds gCpuFreqLock and happens in that thread; a caller in interrupt context
+// is refused before any access. A transient SCMI failure (BUSY, no answer) is retried after a backoff (CpuFreqGovernor.h, Retry; a start
+// that failed this way probes again after it, the thread sleeping meanwhile); a final failure, or a retry budget run out, switches the
+// feature off for the boot and says why on the row; it never panics.
+// armcpu_cpufreq_state: 0 not started, 1 probing (also while a start waits for its retry), 2 running, 3 off after a failure.
+extern "C" {
+volatile uint32_t armcpu_cpufreq_state = 0;
+}
+namespace {
+cpufreq::Control gCpuFreq;
+IOLock *gCpuFreqLock;
+IOMemoryMap *gCpuFreqTx, *gCpuFreqRx, *gCpuFreqShmem;
+uintptr_t gCpuFreqTxVa, gCpuFreqShmemVa;
+uint32_t gCpuFreqMode, gCpuFreqMin;
+bool gCpuFreqScreen;                        // pagani-screenoff bit 0: the governor's screen-off policy (CpuFreqGovernor.h)
+bool gCpuFreqNoRetry;                       // pagani-cpufreq-retry=0: every SCMI failure final (CpuFreqGovernor.h, Retry)
+uint32_t gCpuFreqTouchMs, gCpuFreqLaunchMs; // pagani-cpufreq-touch-ms, pagani-cpufreq-launch-ms (CpuFreqGovernor.h)
+uint32_t gCpuFreqAsks;                      // pagani_cpufreq_boost calls
+uint64_t gCpuFreqSpin;                      // counter ticks a poll spins before it sleeps between reads
+char gCpuFreqShown[cpufreq::kRowWidth + 1];
+// The performance domain of each logical CPU from its DT affinity (MPIDR Aff2: CPUs 0x0-0x500 domain 0, 0x10000 and 0x10100 domain 1),
+// noted as each CPU nub starts; 0 unknown, else domain + 1.
+volatile uint32_t gCpuFreqDomain[ARMCPU_SMP_SLOTS];
+
+void cpufreqNoteCpu (uint32_t logical, uint64_t mpidr)
+{
+  if (logical < ARMCPU_SMP_SLOTS) { gCpuFreqDomain[logical] = ((mpidr >> 16) & 0xff) != 0 ? 2 : 1; }
+}
+
+uint32_t cpufreqRead32 (void *, uint32_t offset)
+{
+  return *reinterpret_cast<volatile uint32_t *> (gCpuFreqShmemVa + offset);
+}
+
+void cpufreqWrite32 (void *, uint32_t offset, uint32_t value)
+{
+  *reinterpret_cast<volatile uint32_t *> (gCpuFreqShmemVa + offset) = value;
+}
+
+// The message is in the shared memory before the doorbell reaches the CPUCP (two Device regions: a full barrier between them).
+void cpufreqRing (void *, uint32_t value)
+{
+  __asm__ volatile ("dsb sy" ::: "memory");
+  *reinterpret_cast<volatile uint32_t *> (gCpuFreqTxVa + scmi::kDoorbell) = value;
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+uint64_t cpufreqNow (void *)
+{
+  uint64_t value;
+  __asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (value) :: "memory");
+  return value;
+}
+
+// The CPUCP answers within microseconds when it is well: spin the first 100 us, then sleep 1 ms between reads up to the timeout.
+void cpufreqPause (void *, uint64_t waited)
+{
+  if (waited < gCpuFreqSpin) { __asm__ volatile ("yield" ::: "memory"); return; }
+  IOSleep (1);
+}
+
+bool cpufreqAllowed (void *)
+{
+  return !ml_at_interrupt_context ();
+}
+
+void cpufreqLog (void *, const char *text)
+{
+  kprintf ("ArmCpu: %s\n", text);
+  boot_progress_trace (text);
+}
+
+// The row when its text changed (BootProgress redraws it only then as well).
+void cpufreqPublish (void)
+{
+  char text[cpufreq::kRowWidth + 1];
+  cpufreq::controlRow (&gCpuFreq, text, sizeof (text));
+  unsigned i = 0;
+  for (; text[i] != 0 && text[i] == gCpuFreqShown[i]; i++) {}
+  if (text[i] == gCpuFreqShown[i]) { return; }
+  for (i = 0; i < sizeof (text); i++) { gCpuFreqShown[i] = text[i]; }
+  boot_progress_cpu_row (text);
+}
+
+void cpufreqOff (const char *reason)
+{
+  gCpuFreq.on = false;
+  unsigned i = 0;
+  for (; reason[i] != 0 && i + 1 < sizeof (gCpuFreq.reason); i++) { gCpuFreq.reason[i] = reason[i]; }
+  gCpuFreq.reason[i] = 0;
+  char line[64];
+  scmi::Text t = {line, 0, sizeof (line)};
+  scmi::put (&t, "cpufreq: off: ");
+  scmi::put (&t, gCpuFreq.reason);
+  cpufreqLog (nullptr, line);
+  armcpu_cpufreq_state = 3;
+  cpufreqPublish ();
+}
+
+// Sleeps until counter tick `at` (a retry's backoff; at least 1 ms, at most 2 s: the backoff is at most cpufreq::kRetryMaxMs).
+void cpufreqSleepUntil (uint64_t at, uint64_t hz)
+{
+  const uint64_t now = cpufreqNow (nullptr), perMs = hz / 1000 != 0 ? hz / 1000 : 1;
+  uint64_t ms = at > now ? (at - now + perMs - 1) / perMs : 1;
+  if (ms == 0) { ms = 1; }
+  if (ms > 2000) { ms = 2000; }
+  IOSleep (static_cast<unsigned> (ms));
+}
+
+// Device memory (uncached) for one register window; the map keeps its descriptor.
+IOMemoryMap *cpufreqMap (uint64_t pa, uint64_t bytes)
+{
+  IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress (pa, bytes, kIODirectionInOut);
+  if (memory == nullptr) { return nullptr; }
+  IOMemoryMap *map = memory->map (kIOMapAnywhere | kIOMapInhibitCache);
+  memory->release ();
+  return map;
+}
+
+// Each known CPU's idle ticks and whether it runs.
+void cpufreqSample (cpufreq::CpuTicks *out)
+{
+  const int last = ml_get_max_cpu_number ();
+  for (unsigned c = 0; c < cpufreq::kCpus; c++) {
+    out[c].known = false; out[c].running = false; out[c].domain = 0; out[c].idle = 0;
+    const uint32_t domain = c < ARMCPU_SMP_SLOTS ? gCpuFreqDomain[c] : 0;
+    if (domain == 0 || static_cast<int> (c) > last) { continue; }
+    processor_t processor = cpu_to_processor (static_cast<int> (c));
+    if (processor == nullptr) { continue; }
+    processor_basic_info_data_t basic = {};
+    processor_cpu_load_info_data_t load = {};
+    host_t host = nullptr;
+    mach_msg_type_number_t count = PROCESSOR_BASIC_INFO_COUNT;
+    if (processor_info (processor, PROCESSOR_BASIC_INFO, &host, reinterpret_cast<processor_info_t> (&basic), &count) != KERN_SUCCESS) {
+      continue;
+    }
+    count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+    if (processor_info (processor, PROCESSOR_CPU_LOAD_INFO, &host, reinterpret_cast<processor_info_t> (&load), &count) != KERN_SUCCESS) {
+      continue;
+    }
+    out[c].known = true;
+    out[c].running = basic.running != 0;
+    out[c].domain = domain - 1;
+    out[c].idle = load.cpu_ticks[CPU_STATE_IDLE];
+  }
+}
+
+void cpufreqRun (void)
+{
+  cpufreq::Control *c = &gCpuFreq;
+  c->log = cpufreqLog;
+  c->logContext = nullptr;
+  uint64_t hz;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (hz));
+  gCpuFreqSpin = hz / 10000;
+  gCpuFreqLock = IOLockAlloc ();
+  if (gCpuFreqLock == nullptr || hz == 0) { cpufreqOff ("no lock"); return; }
+  gCpuFreqTx = cpufreqMap (scmi::kTxBase, scmi::kTxBytes);
+  gCpuFreqRx = cpufreqMap (scmi::kRxBase, scmi::kRxBytes);
+  gCpuFreqShmem = cpufreqMap (scmi::kShmemBase, scmi::kShmemBytes);
+  if (gCpuFreqTx == nullptr) { cpufreqOff ("map tx"); return; }
+  if (gCpuFreqShmem == nullptr) { cpufreqOff ("map shmem"); return; }
+  // The RX window is only for the CPUCP's completion interrupts, which a polled transfer never asks for: nothing reads or writes it, so
+  // a failure to map it is only noted.
+  if (gCpuFreqRx == nullptr) { cpufreqLog (nullptr, "cpufreq: rx window not mapped (not used: completion is polled)"); }
+  gCpuFreqTxVa = static_cast<uintptr_t> (gCpuFreqTx->getVirtualAddress ());
+  gCpuFreqShmemVa = static_cast<uintptr_t> (gCpuFreqShmem->getVirtualAddress ());
+  scmi::Io io = {};
+  io.context = nullptr;
+  io.read32 = cpufreqRead32;
+  io.write32 = cpufreqWrite32;
+  io.ring = cpufreqRing;
+  io.now = cpufreqNow;
+  io.pause = cpufreqPause;
+  io.allowed = cpufreqAllowed;
+  io.hz = hz;
+  io.timeoutMs = scmi::kTimeoutMs;
+  c->perf.channel.io = io;
+  armcpu_cpufreq_state = 1;
+  // Logged before the first access: a stage-2 fault or a hang right here is then the CPUCP windows (Gunyah not mapping them).
+  cpufreqLog (nullptr, "cpufreq: probing CPUCP SCMI (tx 0x17830000 doorbell 0x104, shmem 0x17b4e000)");
+  IOLockLock (gCpuFreqLock);
+  c->screen = gCpuFreqScreen && gCpuFreqMode == cpufreq::kModeGovernor;
+  c->noRetry = gCpuFreqNoRetry;
+  c->touchMs = gCpuFreqTouchMs;
+  c->launchMs = gCpuFreqLaunchMs;
+  bool alive = cpufreq::controlStart (c, gCpuFreqMode, gCpuFreqMin, cpufreqNow (nullptr));
+  IOLockUnlock (gCpuFreqLock);
+  // A start that failed transiently (BUSY, no answer: c->retry.waiting) probes again once its backoff passed, the thread asleep meanwhile;
+  // the retry budgets end it ("CPU scmi off: ... x6"). Each attempt sends what one start sends.
+  while (!alive && c->retry.waiting) {
+    cpufreqPublish ();
+    cpufreqSleepUntil (c->retry.at, hz);
+    IOLockLock (gCpuFreqLock);
+    alive = cpufreq::controlProbe (c, cpufreqNow (nullptr));
+    IOLockUnlock (gCpuFreqLock);
+  }
+  cpufreqPublish ();
+  {
+    char text[cpufreq::kRowWidth + 1];
+    cpufreq::controlRow (c, text, sizeof (text));
+    boot_progress_stage (text);
+  }
+  if (!alive) { armcpu_cpufreq_state = 3; return; }
+  armcpu_cpufreq_state = 2;
+  const uint64_t tick = hz_tick_interval > 1 ? hz_tick_interval : hz / 100;
+  const uint32_t window = gCpuFreqMode == cpufreq::kModeGovernor ? cpufreq::kWindowMs : cpufreq::kRowMs;
+  cpufreq::CpuTicks before[cpufreq::kCpus], now[cpufreq::kCpus];
+  cpufreqSample (before);
+  uint64_t last = cpufreqNow (nullptr), rowAt = last;
+  uint32_t online[scmi::kDomains] = {0, 0};
+  for (;;) {
+    IOSleep (window);
+    const uint64_t at = cpufreqNow (nullptr);
+    cpufreqSample (now);
+    // Each CPU's busy ticks over the window: the governor averages every CPU on its own before it takes a domain's busiest.
+    cpufreq::CpuWindow cpus[cpufreq::kCpus];
+    uint32_t running[scmi::kDomains];
+    cpufreq::cpuWindows (now, before, cpufreq::kCpus, at - last, tick, cpus, running);
+    for (unsigned d = 0; d < scmi::kDomains; d++) {
+      if (running[d] > online[d]) { online[d] = running[d]; }
+    }
+    for (unsigned i = 0; i < cpufreq::kCpus; i++) { before[i] = now[i]; }
+    last = at;
+    const uint32_t touches = pagani_input_touch_events;
+    const uint32_t hint = adreno830_cpu_hint ();
+    cpufreq::GpuHeat heat = {0, 0};
+    heat.deci = adreno830_thermal_state (&heat.flags);
+    cpufreq::ScreenInput screen = {0, 0};
+    if (c->screen) {
+      screen.state = __atomic_load_n (&pagani_screen_state, __ATOMIC_ACQUIRE);
+      screen.keys = __atomic_load_n (&pagani_input_key_events, __ATOMIC_RELAXED);
+    }
+    const cpufreq::LaunchInput launch = {static_cast<uint32_t> (__atomic_load_n (&pagani_app_execs, __ATOMIC_RELAXED)),
+                                         __atomic_load_n (&gCpuFreqAsks, __ATOMIC_RELAXED),
+                                         __atomic_load_n (&pagani_screen_state, __ATOMIC_ACQUIRE),
+                                         static_cast<uint32_t> (__atomic_load_n (&nextpidversion, __ATOMIC_RELAXED))};
+    IOLockLock (gCpuFreqLock);
+    // Both modes: the governor window (2) or a top level still owed (1), and the 5 s check; nothing while a retry's backoff lasts.
+    alive = cpufreq::controlWindowCpus (c, at, cpus, cpufreq::kCpus, touches, hint, heat, screen, launch);
+    IOLockUnlock (gCpuFreqLock);
+    if (!alive) { armcpu_cpufreq_state = 3; cpufreqPublish (); return; }
+    if (at - rowAt >= cpufreq::ticks (hz, cpufreq::kRowMs)) {
+      cpufreq::controlLoads (c, online);
+      online[0] = online[1] = 0;
+      rowAt = at;
+      cpufreqPublish ();
+    }
+  }
+}
+
+void cpufreqThread (void *, wait_result_t)
+{
+  thread_set_thread_name (current_thread (), "pagani-cpufreq");
+  cpufreqRun ();
+  thread_terminate (current_thread ());
+}
+
+// From the boot CPU's start: pagani-cpufreq=1 or 2 starts the thread; absent or 0 does nothing; another value only says so on the row.
+// pagani-screenoff bit 0 adds the governor's screen-off policy (pagani-cpufreq=2 only; the other bits are the GPU's and the panel's).
+// pagani-cpufreq-retry=0 makes every SCMI failure final again (default 1: BUSY and missing answers are retried, CpuFreqGovernor.h).
+// pagani-cpufreq-touch-ms=<ms> and pagani-cpufreq-launch-ms=<ms> (0: no launch boost) set how long the governor holds the touch and launch
+// levels (defaults cpufreq::kTouchMs, cpufreq::kLaunchMs; pagani-cpufreq=2 only).
+void cpufreqStart (void)
+{
+  unsigned mode = 0, mhz = 0, screen = 0, retry = 1, touchMs = cpufreq::kTouchMs, launchMs = cpufreq::kLaunchMs;
+  if (!PE_parse_boot_argn ("pagani-cpufreq", &mode, sizeof (mode)) || mode == cpufreq::kModeOff) { return; }
+  PE_parse_boot_argn ("pagani-cpufreq-min", &mhz, sizeof (mhz));
+  PE_parse_boot_argn ("pagani-screenoff", &screen, sizeof (screen));
+  PE_parse_boot_argn ("pagani-cpufreq-retry", &retry, sizeof (retry));
+  PE_parse_boot_argn ("pagani-cpufreq-touch-ms", &touchMs, sizeof (touchMs));
+  PE_parse_boot_argn ("pagani-cpufreq-launch-ms", &launchMs, sizeof (launchMs));
+  gCpuFreqScreen = (screen & 1u) != 0;
+  gCpuFreqNoRetry = retry == 0;
+  gCpuFreqTouchMs = touchMs;
+  gCpuFreqLaunchMs = launchMs;
+  gCpuFreq.mode = mode;
+  if (mode != cpufreq::kModeMax && mode != cpufreq::kModeGovernor) { cpufreqOff ("bad pagani-cpufreq"); return; }
+  gCpuFreqMode = mode;
+  gCpuFreqMin = mhz;
+  thread_t thread;
+  if (kernel_thread_start (&cpufreqThread, nullptr, &thread) != KERN_SUCCESS) { cpufreqOff ("no thread"); return; }
+  thread_deallocate (thread);
+}
+}  // namespace
+
+// A driver that knows an app is starting asks for the launch boost (pagani-cpufreq-launch-ms, CpuFreqGovernor.h), past the governor's own
+// app-start rule and its touch gate. Any thread, any context: this only counts, the governor's thread takes it at its next window and
+// no SCMI message leaves the caller. The heat and screen-off caps hold as for any boost; without the governor it does nothing. Callers
+// define an empty weak default (the statically linked kernel refuses undefined weak references).
+extern "C" void pagani_cpufreq_boost (void)
+{
+  __atomic_fetch_add (&gCpuFreqAsks, 1u, __ATOMIC_RELAXED);
+}
+
+// pagani-idle: XNU's CPU idle through PSCI CPU_SUSPEND retention states (PsciIdle.h: which states, why, the safety switches; README
+// "CPU idle"). Absent or 0: no processor_idle hook is registered and nothing below runs. Otherwise every CPU registers idleNotify;
+// the boot CPU's start reads the PSCI facts, runs one self-test entry per state with its timer brought forward and only then
+// switches the hook on; a thread logs the counts every pagani-idle-log seconds (default 30, at most 3600; 0: the start lines only).
+// Nothing here panics: whatever fails leaves XNU's own WFI. armcpu_idle_state: 0 not configured, 1 probing, 2 on, 3 off.
+extern "C" {
+volatile uint32_t armcpu_idle_state = 0;
+}
+static bool psciConduit (bool *hvc);
+namespace {
+psciidle::Control gIdle;
+bool gIdleHvc = false;
+uint32_t gIdleLogSeconds = 30;
+
+// The PSCI call of the idle path: psciCall's conduit, but x1-x3 are outputs too (SMCCC result registers: the firmware may change
+// them, and this call is inlined into the idle hook), x4-x17 clobbered as before SMCCC 1.1.
+int64_t idleCall (void *, uint64_t function, uint64_t a, uint64_t b, uint64_t c)
+{
+  register uint64_t x0 __asm__ ("x0") = function;
+  register uint64_t x1 __asm__ ("x1") = a;
+  register uint64_t x2 __asm__ ("x2") = b;
+  register uint64_t x3 __asm__ ("x3") = c;
+  if (gIdleHvc) {
+    __asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) :
+                      : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+  } else {
+    __asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) :
+                      : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+  }
+  return static_cast<int64_t> (x0);
+}
+
+uint64_t idleNow (void *)
+{
+  uint64_t value;
+  __asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (value) :: "memory");
+  return value;
+}
+
+const psciidle::Io gIdleIo = {nullptr, idleCall, idleNow};
+
+void idleLog (const char *text)
+{
+  kprintf ("ArmCpu: %s\n", text);
+  boot_progress_trace (text);
+}
+
+// XNU's processor_idle hook: osfmk/arm64/cpu.c cpu_idle (enter, before its WFI) and cpu_idle_exit (leave), IRQ/FIQ masked, on the
+// idle CPU itself. One atomic load while PSCI idle is off.
+void idleNotify (cpu_id_t, boolean_t enter, uint64_t *)
+{
+  if (!psciidle::running (&gIdle)) { return; }
+  uint64_t mpidr;
+  __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
+  if (!enter) {
+    psciidle::exitIdle (&gIdle, mpidr, idleNow (nullptr));
+    return;
+  }
+  uint64_t ctl, cval;
+  __asm__ volatile ("mrs %0, cntv_ctl_el0\n\tmrs %1, cntv_cval_el0" : "=r" (ctl), "=r" (cval));
+  psciidle::enterIdle (&gIdle, gIdleIo, mpidr, ctl, cval, idleNow (nullptr));
+}
+
+void idleNoteCpu (uint32_t logical, uint64_t mpidr)
+{
+  psciidle::noteCpu (&gIdle, logical, mpidr);
+}
+
+// Boot CPU, before its ml_processor_register: the boot-args. The hook every CPU registers, nullptr while pagani-idle is off, wrong,
+// or the GIC is skipped (armcpu-skip-gic: no timer interrupt, so a CPU must never suspend).
+processor_idle_t idleConfigure (bool skipGic)
+{
+  unsigned mode = 0, c4Us = 0, clUs = 0, logSeconds = 30;
+  if (!PE_parse_boot_argn ("pagani-idle", &mode, sizeof (mode)) || mode == 0) { return nullptr; }
+  PE_parse_boot_argn ("pagani-idle-c4-us", &c4Us, sizeof (c4Us));
+  PE_parse_boot_argn ("pagani-idle-cl-us", &clUs, sizeof (clUs));
+  PE_parse_boot_argn ("pagani-idle-log", &logSeconds, sizeof (logSeconds));
+  gIdleLogSeconds = logSeconds > 3600 ? 3600 : logSeconds;
+  uint64_t hz;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (hz));
+  if (skipGic || !psciidle::configure (&gIdle, mode, hz, c4Us, clUs)) {
+    gIdle.mode = psciidle::kModeOff;
+    armcpu_idle_state = 3;
+    idleLog (skipGic ? "idle: off: armcpu-skip-gic" : "idle: off: pagani-idle must be 1 or 2");
+    return nullptr;
+  }
+  return &idleNotify;
+}
+
+// Secondary CPUs: the same hook, nullptr while pagani-idle is off.
+processor_idle_t idleHook (void)
+{
+  return gIdle.mode != psciidle::kModeOff ? &idleNotify : nullptr;
+}
+
+void idleOff (void)
+{
+  char line[96];
+  psciidle::Text t = psciidle::text (line, sizeof (line));
+  psciidle::put (&t, "idle: off: ");
+  psciidle::put (&t, gIdle.reason != nullptr ? gIdle.reason : "c4 not usable");
+  idleLog (line);
+  armcpu_idle_state = 3;
+}
+
+// One real entry of `state` on the boot CPU before the hook goes on: IRQ/FIQ masked, the virtual timer brought forward to `us` from
+// now (or XNU's own deadline when that is earlier), CPU_SUSPEND, then XNU's deadline put back as it was (an early pop only makes
+// rtclock_intr resync). Logged before the call, so a hang right there is identified.
+bool idleSelfTest (unsigned state, uint32_t us)
+{
+  char line[160];
+  psciidle::Text t = psciidle::text (line, sizeof (line));
+  psciidle::put (&t, "idle: self-test ");
+  psciidle::put (&t, psciidle::kState[state].name);
+  psciidle::put (&t, ' ');
+  psciidle::putHex (&t, psciidle::kState[state].param);
+  psciidle::put (&t, " with the timer in ");
+  psciidle::putDec (&t, us);
+  psciidle::put (&t, " us");
+  idleLog (line);
+  const boolean_t enabled = ml_set_interrupts_enabled (FALSE);
+  uint64_t ctl, cval;
+  __asm__ volatile ("mrs %0, cntv_ctl_el0\n\tmrs %1, cntv_cval_el0" : "=r" (ctl), "=r" (cval));
+  const uint64_t start = idleNow (nullptr);
+  uint64_t deadline = start + psciidle::ticks (gIdle.hz, us);
+  if ((ctl & 3) == 1 && cval < deadline) { deadline = cval; }
+  const uint64_t on = 1;
+  __asm__ volatile ("msr cntv_cval_el0, %0\n\tmsr cntv_ctl_el0, %1\n\tisb" :: "r" (deadline), "r" (on) : "memory");
+  const int32_t rc = psciidle::result32 (idleCall (nullptr, psciidle::kCpuSuspend64, psciidle::kState[state].param, 0, 0));
+  const uint64_t end = idleNow (nullptr);
+  __asm__ volatile ("msr cntv_cval_el0, %0\n\tmsr cntv_ctl_el0, %1\n\tisb" :: "r" (cval), "r" (ctl) : "memory");
+  ml_set_interrupts_enabled (enabled);
+  const bool ok = psciidle::selfTest (&gIdle, state, rc, start, deadline, end);
+  psciidle::selfTestLine (&gIdle, state, line, sizeof (line));
+  idleLog (line);
+  return ok;
+}
+
+void idleThread (void *, wait_result_t)
+{
+  thread_set_thread_name (current_thread (), "pagani-idle");
+  psciidle::Snapshot then, now;
+  psciidle::snapshot (&gIdle, &gIdleIo, idleNow (nullptr), &then);
+  for (;;) {
+    IOSleep (gIdleLogSeconds * 1000);
+    psciidle::snapshot (&gIdle, &gIdleIo, idleNow (nullptr), &now);
+    char line[256];
+    psciidle::periodLine (&gIdle, &then, &now, line, sizeof (line));
+    idleLog (line);
+    then = now;
+    if (!psciidle::running (&gIdle)) { armcpu_idle_state = 3; break; }
+  }
+  thread_terminate (current_thread ());
+}
+
+// Boot CPU, after initCPU (its GIC interface and timer interrupt are on) and before any secondary CPU starts (SET_SUSPEND_MODE
+// needs the others off): probe, self-tests, on, the log thread.
+void idleStart (void)
+{
+  if (gIdle.mode == psciidle::kModeOff) { return; }
+  armcpu_idle_state = 1;
+  bool hvc = false;
+  if (!psciConduit (&hvc)) {
+    psciidle::fail (&gIdle, "no /psci method");
+    idleOff ();
+    return;
+  }
+  gIdleHvc = hvc;
+  idleLog (hvc ? "idle: probing PSCI over HVC" : "idle: probing PSCI over SMC");
+  char line[256];
+  const bool probed = psciidle::probe (&gIdle, gIdleIo);
+  psciidle::factsLine (&gIdle, line, sizeof (line));
+  idleLog (line);
+  if (!probed) { idleOff (); return; }
+  if (!idleSelfTest (psciidle::kC4, 2000)) { idleOff (); return; }
+  if (psciidle::usable (&gIdle, psciidle::kCl5)) { idleSelfTest (psciidle::kCl5, 12000); }
+  if (!psciidle::start (&gIdle)) { idleOff (); return; }
+  armcpu_idle_state = 2;
+  psciidle::configLine (&gIdle, line, sizeof (line));
+  idleLog (line);
+  if (gIdleLogSeconds == 0) { return; }
+  thread_t thread;
+  if (kernel_thread_start (&idleThread, nullptr, &thread) != KERN_SUCCESS) { idleLog ("idle: no log thread"); return; }
+  thread_deallocate (thread);
+}
+}  // namespace
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
 {
@@ -386,6 +914,8 @@ bool ArmCpu::start (IOService *provider)
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
   logicalId = static_cast<uint32_t> (ml_get_cpu_number (physical));
   secondary = logicalId != static_cast<uint32_t> (ml_get_boot_cpu_number ());
+  cpufreqNoteCpu (logicalId, physical);
+  idleNoteCpu (logicalId, physical);
   if (secondary) {
     if (!IOCPU::start (provider)) { return false; }
     armcpu_smp_step[logicalId] = 1;
@@ -411,6 +941,7 @@ bool ArmCpu::start (IOService *provider)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
   info.cluster_type = ml_get_boot_cluster_type ();
+  info.processor_idle = idleConfigure (skipGic);   // pagani-idle; nullptr (XNU's plain WFI) when off
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
@@ -435,9 +966,11 @@ bool ArmCpu::start (IOService *provider)
   }
   gController = controller;
   initCPU (true);
+  idleStart ();   // pagani-idle: probe and self-test on this CPU while the secondaries are still off
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
   drainPending ();
+  cpufreqStart ();
   return true;
 }
 
@@ -461,6 +994,7 @@ bool ArmCpu::finishSecondary (void)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
   info.cluster_type = ml_get_boot_cluster_type ();
+  info.processor_idle = idleHook ();   // pagani-idle; nullptr when off
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
@@ -840,4 +1374,39 @@ extern "C" uint64_t armcpu_spi_count (uint32_t intid)
     if (gSpi[slot].id == intid) { return gSpi[slot].count; }
   }
   return 0;
+}
+
+// Switch an attached SPI off (GICD_ICENABLER, then RWP) or on again (GICD_ISENABLER); the slot and the line's configuration
+// stay. Only an INTID attached through armcpu_spi_attach is accepted (kIOReturnBadArgument otherwise). A driver's storm guard
+// calls disable from its own handler, before the EOI, so neither takes a lock or sleeps.
+extern "C" IOReturn armcpu_spi_disable (uint32_t intid);
+extern "C" IOReturn armcpu_spi_enable (uint32_t intid);
+
+static bool spiRwpClear (volatile uint32_t *)
+{
+  return waitClear (gDist, 0, 1U << 31);
+}
+
+static IOReturn spiGate (uint32_t intid, bool enable)
+{
+  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  switch (armCpuSpiGate (reinterpret_cast<volatile uint32_t *> (gDist), gDist != 0 && armcpu_gic_ready != 0,
+                         armCpuSpiAttached (gSpi, used, intid), intid, enable, spiRwpClear)) {
+  case ArmCpuSpiGateOk: return kIOReturnSuccess;
+  case ArmCpuSpiGateNotReady: return kIOReturnNotReady;
+  case ArmCpuSpiGateNotAttached: return kIOReturnBadArgument;
+  case ArmCpuSpiGateTimeout: return kIOReturnTimeout;
+  default: break;
+  }
+  return kIOReturnError;
+}
+
+extern "C" IOReturn armcpu_spi_disable (uint32_t intid)
+{
+  return spiGate (intid, false);
+}
+
+extern "C" IOReturn armcpu_spi_enable (uint32_t intid)
+{
+  return spiGate (intid, true);
 }

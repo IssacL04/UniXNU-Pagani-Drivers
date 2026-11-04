@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,8 @@
 #include <PeripheralIO.h>
 #include <Rpmh.h>
 #include <PaganiPeripherals.h>
+#include "Drv2Lock.h"
+#include "InputScript.h"
 #include "../../BootProgress/PeripheralStatus.h"
 
 static unsigned spiReads,spiWrites,spiSnapshots,dmaSnapshots,readSnapshots,statusReads,timingReads;
@@ -353,6 +356,12 @@ struct PowerWindow {
     peripheral_io io() {return mapped;}
 };
 static void IOSleep(unsigned ms) {powerWaited+=ms;}
+// DRV-2 lock waits: 10 us each; lockReleaseAfter > 0 frees the word (held by the GPU) after that many waits.
+static unsigned lockDelays,lockReleaseAfter;
+static void IODelay(unsigned us) {
+    assert(us==PaganiDrv2StepUs);
+    if (++lockDelays==lockReleaseAfter) __atomic_store_n(&sm8750_rpmh_drv2_owner,0u,__ATOMIC_RELEASE);
+}
 struct PowerHarness {
     PowerWindow rsc,cmddb;uint32_t sample=0;
     const char *phase="";
@@ -419,6 +428,17 @@ static void power() {
     db=commandDb();mapped.complete=false;
     assert(device.setupTouchPower()==-110 && powerSnapshots==1 && powerSnapshot[0]==0x40800);
     assert(!strcmp(device.phase,"power VDD") && powerWaited==200); // No second rail or reset wait after failure.
+    assert(sm8750_rpmh_drv2_owner==0 && lockDelays==0); // The lock was free, taken and given back on the failure path.
+    // DRV-2 held by the GPU driver: the touch votes wait for it, then go out under the touch owner.
+    Rsc shared;db=commandDb();powerRsc=&shared;
+    sm8750_rpmh_drv2_owner=0x41383330;lockReleaseAfter=500;
+    assert(!device.setupTouchPower() && lockDelays==500 && sm8750_rpmh_drv2_owner==0 && powerWaited==400);
+    assert(shared.regs[0xd00+shared.msg+4]==0x41900);
+    // Never released: -16 after 2 s of 10 us waits, no TCS touched, the other owner's word left alone.
+    Rsc untouched;powerRsc=&untouched;lockDelays=0;lockReleaseAfter=0;sm8750_rpmh_drv2_owner=0x41383330;
+    assert(device.setupTouchPower()==-16 && lockDelays==PaganiDrv2Steps && untouched.writes.empty());
+    assert(sm8750_rpmh_drv2_owner==0x41383330 && !strcmp(device.phase,"power lock") && device.sample==PaganiDrv2Steps);
+    sm8750_rpmh_drv2_owner=0;
 }
 static void spiTiming() {
     MMIO m;auto io=m.io();uint32_t readback=0;
@@ -473,21 +493,239 @@ static void touch() {
     for (unsigned n=0;n<10;++n) assert(report[1+6*n]==2 && report[2+6*n]==n);
     bus.message(0x10,std::vector<uint8_t>(24));assert(s3910_poll(&d,&frame)==-104 && !d.ready);
 }
+// Report 2 field map from the descriptor: bit -> (page<<16|usage), 0 for padding.
+static std::vector<uint32_t> buttonFields() {
+    std::vector<uint32_t> fields,usages;unsigned page=0,size=0,count=0,id=0;
+    const uint8_t *bytes=buttonsDescriptor;
+    for (size_t offset=0;offset<sizeof buttonsDescriptor;) {
+        uint8_t tag=bytes[offset++];unsigned n=tag&3;if (n==3) n=4;
+        unsigned value=0;for (unsigned i=0;i<n;++i) value|=(unsigned)bytes[offset++]<<(8*i);
+        switch (tag&0xfc) {
+            case 0x04:page=value;break;
+            case 0x08:usages.push_back(n==4?value:(page<<16|value));break;
+            case 0x74:size=value;break;
+            case 0x94:count=value;break;
+            case 0x84:id=value;break;
+            case 0x80:
+                for (unsigned i=0;i<count && id==2;++i) for (unsigned b=0;b<size;++b)
+                    fields.push_back((value&1)?0:usages[std::min<size_t>(i,usages.size()-1)]);
+                usages.clear();break;
+            case 0xa0:case 0xc0:usages.clear();break;
+        }
+    }
+    return fields;
+}
+static void buttonDescriptor() {
+    auto fields=buttonFields();
+    const std::vector<uint32_t> expected={0xc0040,0xc0030,0xc00e9,0xc00ea,0xb002e,0,0,0};
+    assert(fields==expected);
+    // The driver's key bits are the descriptor's fields; the Plus key itself is never a report field.
+    assert(fields[__builtin_ctz(PAGANI_KEY_POWER)]==0xc0030 && fields[__builtin_ctz(PAGANI_KEY_VOLUME_UP)]==0xc00e9);
+    assert(fields[__builtin_ctz(PAGANI_KEY_VOLUME_DOWN)]==0xc00ea && fields[__builtin_ctz(PAGANI_REPORT_RING)]==0xb002e);
+    assert(!(PAGANI_KEYS_PMIC&PAGANI_REPORT_RING));
+}
+// Polls every PAGANI_KEYS_POLL_MS like the driver timer and records each report change with its time.
+struct KeyRun {
+    pagani_keys keys=pagani_keys_initial();
+    uint64_t now=100000;int last=-1;
+    std::vector<std::pair<uint64_t,uint8_t>> changes;
+    uint8_t poll(uint8_t raw,uint8_t valid=PAGANI_KEYS_PMIC|PAGANI_KEY_PLUS) {
+        uint8_t report=pagani_keys_step(&keys,valid,raw,now);
+        if (report!=last) {changes.emplace_back(now,report);last=report;}
+        now+=PAGANI_KEYS_POLL_MS;return report;
+    }
+    uint8_t hold(uint8_t raw,unsigned ms,uint8_t valid=PAGANI_KEYS_PMIC|PAGANI_KEY_PLUS) {
+        uint8_t report=0;for (unsigned t=0;t<ms;t+=PAGANI_KEYS_POLL_MS) report=poll(raw,valid);return report;
+    }
+    // Time from the first poll that sees `raw` until the report equals `want`.
+    unsigned latency(uint8_t raw,uint8_t want) {
+        uint64_t start=now;
+        for (unsigned i=0;i<64;++i) if (poll(raw)==want) return (unsigned)(now-PAGANI_KEYS_POLL_MS-start);
+        return ~0u;
+    }
+};
 static void buttons() {
-    assert(pagani_buttons(0,1)==0 && pagani_buttons(0x80,1)==2);
-    assert(pagani_buttons(0x40,1)==4 && pagani_buttons(0,0)==8 && pagani_buttons(0xc0,0)==14);
-    pagani_button_filter f={};
-    assert(pagani_buttons_filter(&f,1,2,0)==0);
-    assert(pagani_buttons_filter(&f,1,0,16)==0);
-    assert(pagani_buttons_filter(&f,1,2,32)==0);
-    assert(pagani_buttons_filter(&f,1,2,63)==0);
-    assert(pagani_buttons_filter(&f,1,2,64)==2);
-    assert(pagani_buttons_filter(&f,1,2,10000)==2); // Long press remains asserted.
-    assert(pagani_buttons_filter(&f,0,2,10001)==0); // A bus failure releases it.
-    assert(pagani_buttons_filter(&f,1,2,10002)==0);
-    assert(pagani_buttons_filter(&f,1,2,10034)==2);
-    assert(pagani_buttons_filter(&f,1,0,10035)==2);
-    assert(pagani_buttons_filter(&f,1,0,10067)==0);
+    const uint8_t RING=PAGANI_REPORT_RING,POWER=PAGANI_KEY_POWER,UP=PAGANI_KEY_VOLUME_UP,DOWN=PAGANI_KEY_VOLUME_DOWN;
+    const uint8_t PLUS=PAGANI_KEY_PLUS;
+    // Raw levels: PON bits 7/6 high when pressed; PMIC GPIO and TLMM Plus input low when pressed.
+    assert(pagani_buttons(0,1,1)==0 && pagani_buttons(0x80,1,1)==POWER && pagani_buttons(0x40,1,1)==UP);
+    assert(pagani_buttons(0,0,1)==DOWN && pagani_buttons(0,1,0)==PLUS && pagani_buttons(0xc0,0,0)==30);
+    assert(pagani_buttons(0x3f,0xfe,0xfffffffe)==(DOWN|PLUS)); // Only the wired bits count.
+
+    // Start: no key, ring position, reported at once.
+    KeyRun run;assert(run.poll(0)==RING && run.changes.size()==1);
+    run.hold(0,64);
+    // PON keys: confirmed after 16 ms (3 polls), both edges; within one poll period of the first sample that sees them.
+    assert(run.latency(POWER,RING|POWER)==PAGANI_PON_STABLE_MS);
+    assert(run.hold(POWER,10000)==(RING|POWER) && run.changes.size()==2);   // A 10 s press stays one press.
+    assert(run.latency(0,RING)==PAGANI_PON_STABLE_MS);
+    // A PON press within 32 ms of the release is held back, not lost (Linux pm8941-pwrkey software debounce).
+    uint64_t released=run.changes.back().first;
+    assert(run.latency(POWER,RING|POWER)==PAGANI_PON_STABLE_MS+8 && run.changes.back().first==released+PAGANI_PON_RELOCK_MS);
+    run.hold(POWER,40);assert(run.latency(0,RING)==PAGANI_PON_STABLE_MS);
+    // A 24 ms bounce right after a release is rejected: it ends before the relock.
+    size_t before=run.changes.size();
+    run.hold(POWER,24);run.hold(0,200);assert(run.changes.size()==before && run.last==RING);
+    // Volume Down and the Plus key follow Android's 32 ms gpio-keys debounce, both edges, without relock.
+    assert(run.latency(DOWN,RING|DOWN)==PAGANI_GPIO_STABLE_MS);
+    assert(run.latency(0,RING)==PAGANI_GPIO_STABLE_MS);
+    assert(run.latency(DOWN,RING|DOWN)==PAGANI_GPIO_STABLE_MS);
+    run.hold(DOWN,600);assert(run.latency(0,RING)==PAGANI_GPIO_STABLE_MS);
+    // Contact chatter and one-poll glitches never change the report.
+    before=run.changes.size();
+    for (unsigned i=0;i<50;++i) run.poll(i&1?DOWN|POWER:0);
+    for (unsigned i=0;i<20;++i) {run.poll(i%4?0:UP|DOWN|PLUS);}
+    run.hold(0,64);assert(run.changes.size()==before && run.last==RING);
+
+    // Screenshot chord: Power and Volume Up confirmed in the same poll arrive in one report; 8 ms apart keeps their order.
+    run.hold(0,64);before=run.changes.size();
+    assert(run.latency(POWER|UP,RING|POWER|UP)==PAGANI_PON_STABLE_MS && run.changes.size()==before+1);
+    run.hold(POWER|UP,300);run.hold(0,64);
+    run.poll(POWER);before=run.changes.size();
+    run.hold(POWER|UP,40);
+    assert(run.changes.size()==before+2 && run.changes[before].second==(RING|POWER));
+    assert(run.changes[before+1].second==(RING|POWER|UP) && run.changes[before+1].first==run.changes[before].first+8);
+    run.hold(0,64);assert(run.last==RING);
+
+    // Ring/silent switch: each confirmed Plus press flips it at the press; holding or releasing does not.
+    assert(run.latency(PLUS,0)==PAGANI_GPIO_STABLE_MS);
+    assert(run.hold(PLUS,3000)==0);
+    assert(run.hold(0,100)==0);
+    assert(run.latency(PLUS,RING)==PAGANI_GPIO_STABLE_MS);
+    run.hold(0,100);
+    // Keys keep working while silent, and the silent level stays in every report.
+    assert(run.latency(PLUS,0)==PAGANI_GPIO_STABLE_MS);run.hold(0,100);
+    assert(run.latency(POWER,POWER)==PAGANI_PON_STABLE_MS && run.latency(0,0)==PAGANI_PON_STABLE_MS);
+    run.hold(PLUS,24);run.hold(0,100);assert(run.last==0);   // A 24 ms Plus blip is not a press.
+    assert(run.latency(PLUS,RING)==PAGANI_GPIO_STABLE_MS);run.hold(0,100);
+
+    // A Plus key held (or stuck low) since boot does not silence; the first press after a confirmed release does.
+    KeyRun held;
+    assert(held.hold(PLUS,5000)==RING && held.changes.size()==1);
+    assert(held.hold(0,24)==RING);       // Not yet a confirmed release.
+    assert(held.hold(PLUS,100)==RING);
+    assert(held.hold(0,40)==RING && held.latency(PLUS,0)==PAGANI_GPIO_STABLE_MS);
+
+    // A failed PMIC read releases Power/Volume at once and restarts their debounce; the Plus key and the switch stay.
+    KeyRun bus;bus.hold(0,64);
+    assert(bus.latency(PLUS,0)==PAGANI_GPIO_STABLE_MS);
+    assert(bus.latency(POWER|PLUS,POWER)==PAGANI_PON_STABLE_MS);
+    assert(bus.poll(POWER|PLUS,PAGANI_KEY_PLUS)==0);
+    assert(bus.poll(POWER|PLUS)==0 && bus.poll(POWER|PLUS)==0 && bus.poll(POWER|PLUS)==POWER);
+    // A Plus input that becomes unavailable disarms the switch until it is seen released again.
+    assert(bus.poll(POWER|PLUS,PAGANI_KEYS_PMIC)==POWER);
+    assert(bus.hold(POWER|PLUS,100)==POWER);
+    assert(bus.hold(PLUS,100)==0 && bus.hold(0,40)==0 && bus.latency(PLUS,RING)==PAGANI_GPIO_STABLE_MS);
+
+    // Time moving backwards restarts the debounce instead of confirming a level.
+    pagani_keys k=pagani_keys_initial();
+    assert(pagani_keys_step(&k,PAGANI_KEYS_PMIC,POWER,1000)==RING);
+    assert(pagani_keys_step(&k,PAGANI_KEYS_PMIC,POWER,500)==RING);
+    assert(pagani_keys_step(&k,PAGANI_KEYS_PMIC,POWER,515)==RING && pagani_keys_step(&k,PAGANI_KEYS_PMIC,POWER,516)==(RING|POWER));
+
+    // TLMM CFG: gpio function, no pull, input, 6 mA; bits above the pad configuration are kept.
+    assert(pagani_plus_key_config(0)==0x80 && pagani_plus_key_config(0x3ff)==0x80);
+    assert(pagani_plus_key_config(0xfffffe05)==0xfffffc80 && pagani_plus_key_config(0x1c7)==0x80);
+    assert(pagani_keys_sample(0x80,0x01,1,1,1)==0x78001 && pagani_keys_sample(0,0,0,0,0)==0);
+    assert(pagani_keys_sample(0xc0,0xfe,0xfffffffe,0,1)==0x4c0fe);
+}
+// The driver's key report counter (PaganiInput.cpp, read by PaganiArmCpu's screen-off policy): one per report the HID parser took.
+volatile uint32_t pagani_input_key_events;
+volatile uint32_t pagani_input_power_held;
+// The driver's own Plus key setup and poll (PaganiInput.cpp), against TLMM and SPMI models.
+namespace keys_adapter {
+struct PeripheralWindow {
+    uint32_t cfg=0x1c5,level=1;uint64_t address=0;
+    bool mapped=false,mappable=true,sticky=false;unsigned writes=0,releases=0;
+    bool map(uint64_t at,unsigned size) {assert(size==0x1000 && !mapped);address=at;mapped=mappable;return mapped;}
+    void release() {mapped=false;++releases;}
+    static uint32_t read(void *ctx,uint32_t reg) {
+        auto &w=*static_cast<PeripheralWindow *>(ctx);assert(w.mapped && (reg==0 || reg==4));return reg?w.level:w.cfg;
+    }
+    static void write(void *ctx,uint32_t reg,uint32_t value) {
+        auto &w=*static_cast<PeripheralWindow *>(ctx);assert(w.mapped && reg==0);++w.writes;if (!w.sticky) w.cfg=value;
+    }
+};
+struct Device {
+    PeripheralWindow plusKey;MMIO obs;
+    int pon=3,gpio=5;
+    pagani_keys keys=pagani_keys_initial();
+    uint8_t lastButtons=0;bool plusConfigured=false,sendWorks=true;
+    uint32_t plusSaved=0,sample=0;const char *phase="";int result=0;
+    std::vector<uint8_t> reports;
+    Device() {obs.spmi=true;obs.regs[3*0x20+0x18]=0;obs.regs[5*0x20+0x18]=1;}
+    void observe(const char *stage,int rc=0) {phase=stage;result=rc;}
+    bool send(const void *bytes,size_t size) {
+        auto report=static_cast<const uint8_t *>(bytes);assert(size==2 && report[0]==2);
+        if (sendWorks) reports.push_back(report[1]);
+        return sendWorks;
+    }
+    void levels(uint8_t ponLevel,uint8_t gpioLevel,uint32_t plusLevel) {
+        obs.regs[3*0x20+0x18]=ponLevel;obs.regs[5*0x20+0x18]=gpioLevel;plusKey.level=plusLevel;
+    }
+#include "PaganiButtons.inc"
+};
+}
+static void buttonAdapter() {
+    using keys_adapter::Device;
+    Device d;d.setupPlusKey();
+    assert(d.plusKey.address==0xf161000 && d.plusConfigured && d.plusSaved==0x1c5 && d.plusKey.cfg==0x80);
+    assert(d.sample==0x80 && !strcmp(d.phase,"Plus key"));
+    // Ring is reported on the first poll (the elements start at 0, silent), before backboardd copies the switch level.
+    const uint32_t keyEvents=pagani_input_key_events;
+    uint64_t ms=1000;d.pollButtons(ms);
+    assert(d.reports==std::vector<uint8_t>({PAGANI_REPORT_RING}) && d.sample==0x70001 && pagani_input_key_events==keyEvents+1);
+    for (unsigned i=1;i<10;++i) d.pollButtons(ms+=8);
+    assert(d.reports.size()==1 && !strcmp(d.phase,"PMIC sample") && d.result==0);
+    // Plus press: silent after 32 ms; the sample shows the low input and ring 0.
+    d.levels(0,1,0);for (unsigned i=0;i<5;++i) d.pollButtons(ms+=8);
+    assert(d.reports.back()==0 && d.sample==0x40001);
+    d.levels(0,1,1);for (unsigned i=0;i<6;++i) d.pollButtons(ms+=8);
+    // Power with Volume Down; a failed send is retried on the next poll. Only reports the parser took count as key events.
+    d.levels(0x80,0,1);d.sendWorks=false;const uint32_t beforePower=pagani_input_key_events;
+    for (unsigned i=0;i<5;++i) d.pollButtons(ms+=8);
+    assert(d.reports.back()==0 && d.lastButtons==0 && pagani_input_key_events==beforePower);
+    d.sendWorks=true;d.pollButtons(ms+=8);
+    assert(d.reports.back()==(PAGANI_KEY_POWER|PAGANI_KEY_VOLUME_DOWN) && d.lastButtons==d.reports.back());
+    assert(pagani_input_key_events==beforePower+1);
+    // The UFS log's word: the debounced Power key, whether or not the report got out; down alone it counts too, Volume Down alone does not.
+    assert(pagani_input_power_held==1);
+    d.levels(0x80,1,1);for (unsigned i=0;i<6;++i) d.pollButtons(ms+=8);
+    assert(pagani_input_power_held==1);
+    d.levels(0,0,1);for (unsigned i=0;i<6;++i) d.pollButtons(ms+=8);
+    assert(pagani_input_power_held==0);
+    d.levels(0x80,0,1);d.sendWorks=false;for (unsigned i=0;i<12;++i) d.pollButtons(ms+=8);
+    assert(pagani_input_power_held==1);
+    d.sendWorks=true;d.pollButtons(ms+=8);
+    // An SPMI timeout releases both PMIC keys in the same poll and is shown with the PMIC sample.
+    d.obs.complete=false;d.pollButtons(ms+=8);
+    assert(d.reports.back()==0 && pagani_input_power_held==1);   // the UFS log's word keeps the last confirmed level
+    d.pollButtons(ms+=8);assert(!strcmp(d.phase,"PMIC sample") && d.result==-110);
+    // The Plus key does not depend on SPMI: while the PMIC reads keep failing, each confirmed press still flips the switch.
+    for (uint8_t want:{(uint8_t)PAGANI_REPORT_RING,(uint8_t)0}) {
+        d.plusKey.level=0;for (unsigned i=0;i<5;++i) d.pollButtons(ms+=8);
+        assert(d.reports.back()==want && !(d.sample&0x10000) && ((d.sample>>18)&1));
+        d.plusKey.level=1;for (unsigned i=0;i<5;++i) d.pollButtons(ms+=8);
+        assert(d.reports.back()==want && !strcmp(d.phase,"PMIC sample") && d.result==-110);
+    }
+    // The reads come back with the key still down: the word never shows it up, through the whole debounce. Then a confirmed release.
+    assert(pagani_input_power_held==1);
+    d.obs.complete=true;d.levels(0x80,0,1);
+    for (unsigned i=0;i<8;++i) {d.pollButtons(ms+=8);assert(pagani_input_power_held==1);}
+    d.levels(0,1,1);for (unsigned i=0;i<6;++i) d.pollButtons(ms+=8);
+    assert(pagani_input_power_held==0);
+    d.obs.complete=true;d.levels(0,1,1);
+    // Cleanup puts back the CFG found at start.
+    d.releasePlusKey();assert(!d.plusConfigured && d.plusKey.cfg==0x1c5 && !d.plusKey.mapped && d.plusKey.releases==1);
+    d.pollButtons(ms+=8);assert(d.sample==0x10001);   // Without the pin: released level, silent kept, not present.
+
+    // A pin that does not take the configuration is put back and left out; the PMIC keys still report.
+    Device sticky;sticky.plusKey.sticky=true;sticky.setupPlusKey();
+    assert(!sticky.plusConfigured && !sticky.plusKey.mapped && sticky.plusKey.writes==2 && sticky.plusKey.cfg==0x1c5);
+    sticky.pollButtons(1000);assert(sticky.reports==std::vector<uint8_t>({PAGANI_REPORT_RING}) && sticky.sample==0x30001);
+    Device unmapped;unmapped.plusKey.mappable=false;unmapped.setupPlusKey();
+    assert(!unmapped.plusConfigured && !unmapped.plusKey.writes);
+    unmapped.releasePlusKey();assert(unmapped.plusKey.releases==1 && !unmapped.plusKey.writes);
 }
 static void buses() {
     MMIO core,cnfg,obs;auto c=core.io(),f=cnfg.io(),o=obs.io();
@@ -509,7 +747,7 @@ static void panel() {
     MMIO m;m.dsi=true;m.regs[4]=1;m.regs[0x110]=0x20010102;m.regs[0x3c]=0xa5;m.regs[0x390]=2;m.regs[0x4c]=32;
     auto io=m.io();assert(!dsi_panel_command(&io,0x51,0x599));
     std::vector<uint32_t> fifo;for (auto [reg,value]:m.writes) if (reg==0x17c) fifo.push_back(value);
-    assert(fifo==std::vector<uint32_t>({0xc0390003,0xff059951}));
+    assert(fifo==std::vector<uint32_t>({0xc0390003,0xff990551}));  // 51 05 99: high byte first, as the panel's own 51 0d bb table
     assert(m.regs[0x3c]==0xa5 && m.regs[0x390]==2 && m.regs[0x4c]==32 && !m.regs[0x15c]);
     assert((m.regs[0x110]&0x10100)==0x10100); // Do not acknowledge unrelated frame completions.
     m.writes.clear();assert(!dsi_panel_command(&io,0x28,0));
@@ -520,8 +758,10 @@ static void panel() {
     assert(m.regs[0x15c]==0x30006); // No reset while the engine may still own the command.
     m.writes.clear();assert(dsi_panel_command(&io,0x51,1)==-19 && m.writes.empty());
 }
+#include "InputScriptTests.h"
 int main() {
     spiRead();touchV2();
     descriptor(buttonsDescriptor,sizeof buttonsDescriptor,false);descriptor(touchDescriptor,sizeof touchDescriptor,true);
-    touch();edgeContacts();buttons();buses();panel();power();spiTiming();puts("PASS: SPI, TouchComm v1/v2, touchscreen identity, HID contacts/edge lifecycle, buttons, RPMh and timing");
+    buttonDescriptor();
+    touch();edgeContacts();buttons();buttonAdapter();buses();panel();power();spiTiming();inputScript();puts("PASS: SPI, TouchComm v1/v2, touchscreen identity, HID contacts/edge lifecycle, buttons with the ring/silent switch, RPMh with the DRV-2 lock and timing, input script timeline/keys/aborts/default off");
 }

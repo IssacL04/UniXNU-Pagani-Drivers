@@ -27,6 +27,19 @@ static inline int native_legacy_blank_state(uint32_t updated,
     return background == 0;
 }
 
+// What slot 188 answers without a "dot-pitch" property on the provider, which
+// no board here has and GOP does not supply. MobileGestalt's main-screen-pitch
+// comes from here alone: UIKit's keyboard Dock turns millimetres into points
+// with it, and slot 189 divides the panel's pixels by it for the display area
+// (CADisplay's physicalSize, read by QuartzCore without looking at the result).
+// 460: the 13T's 6.32 inch 1216x2640 panel has 459.9 pixels per inch, and it is
+// the iPhone 15 Pro's own value. Boot-arg pagani-dot-pitch replaces it; 0 keeps
+// the answer of before, no value (kIOReturnNotFound).
+#define NATIVE_LEGACY_DOT_PITCH 460U
+static inline uint32_t native_legacy_dot_pitch(int argumentFound, uint32_t argument) {
+    return argumentFound ? argument : NATIVE_LEGACY_DOT_PITCH;
+}
+
 // IOSurface rows and allocation have independent alignment. Copy visible
 // pixels only, after bounding every row in the real memory descriptor.
 static inline int native_legacy_surface_bounds(uint32_t width,uint32_t height,
@@ -36,9 +49,11 @@ static inline int native_legacy_surface_bounds(uint32_t width,uint32_t height,
     return allocation>=stride*height && descriptorBytes>=allocation;
 }
 
-// The GOP destination is device memory: use aligned scalar pixel stores,
-// never a general memcpy that may issue unaligned or wider device accesses.
-// The source is normal mapped IOSurface memory and may have padded rows.
+// Layout check shared by the copies. The source is normal mapped IOSurface
+// memory and may have padded rows. A Device (inhibit) scanout mapping takes only
+// aligned scalar stores (native_legacy_copy_pixels, never a general memcpy that
+// may issue unaligned device accesses); the write-combined mapping takes
+// native_legacy_copy_rows. The caller ends either with dsb sy.
 static inline int native_legacy_copy_layout(volatile void *destination,
     uint64_t destinationBytes, uint64_t destinationStride, const void *source,
     uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
@@ -144,6 +159,63 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
             __builtin_memcpy(&value,in+(uint64_t)column*4,4);
             out[column]=value;
         }
+    }
+    return 1;
+}
+
+// Write-combined (Normal non-cacheable) scanout: rows are plain memory, so an ordinary memcpy may use
+// wide and unaligned stores that the write buffer gathers into bursts; the caller ends with dsb sy.
+static inline int native_legacy_copy_rows(void *destination,
+    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
+    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
+    if (!native_legacy_copy_layout(destination,destinationBytes,destinationStride,
+        source,sourceBytes,sourceStride,width,height)) return 0;
+    unsigned char *dst=(unsigned char *)destination;
+    const unsigned char *src=(const unsigned char *)source;
+    uint64_t row=(uint64_t)width*4;
+    if (destinationStride==row && sourceStride==row) {
+        __builtin_memcpy(dst,src,row*height);
+        return 1;
+    }
+    for (uint32_t y=0;y<height;++y)
+        __builtin_memcpy(dst+(uint64_t)y*destinationStride,src+(uint64_t)y*sourceStride,row);
+    return 1;
+}
+
+// While the GPU status rows are shown (BootProgress boot_progress_gpu_band, design 8.5) rows [y0,y1) of the
+// scanout belong to them: a frame covers [0,y0) and [y1,height) only, so the rows stay visible without being
+// redrawn every frame. y0==y1 covers everything. wc picks native_legacy_copy_rows (write-combined scanout) over
+// native_legacy_copy_pixels (Device scanout).
+static inline int native_legacy_copy_band(volatile void *destination,
+    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
+    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height,
+    uint32_t y0, uint32_t y1, int wc) {
+    if (y0>y1 || y1>height || !native_legacy_copy_layout(destination,destinationBytes,destinationStride,
+        source,sourceBytes,sourceStride,width,height)) return 0;
+    const uint32_t first[2]={0,y1}, rows[2]={y0,height-y1};
+    for (unsigned part=0;part<2;++part) {
+        if (!rows[part]) continue;
+        const uint64_t d=(uint64_t)first[part]*destinationStride, s=(uint64_t)first[part]*sourceStride;
+        const uintptr_t out=(uintptr_t)destination+d;
+        const unsigned char *in=(const unsigned char *)source+s;
+        if (!(wc ? native_legacy_copy_rows((void *)out,destinationBytes-d,destinationStride,in,sourceBytes-s,
+                       sourceStride,width,rows[part])
+                 : native_legacy_copy_pixels((volatile void *)out,destinationBytes-d,destinationStride,in,
+                       sourceBytes-s,sourceStride,width,rows[part]))) return 0;
+    }
+    return 1;
+}
+static inline int native_legacy_fill_band(volatile void *destination,
+    uint64_t destinationBytes, uint64_t destinationStride,
+    uint32_t width, uint32_t height, uint32_t y0, uint32_t y1, uint32_t value) {
+    uintptr_t dst=(uintptr_t)destination;
+    if (y0>y1 || y1>height || !dst || (dst&3) || (destinationStride&3) ||
+        !native_legacy_surface_bounds(width,height,destinationStride,destinationBytes,destinationBytes)) return 0;
+    const uint32_t first[2]={0,y1}, rows[2]={y0,height-y1};
+    for (unsigned part=0;part<2;++part) {
+        const uint64_t d=(uint64_t)first[part]*destinationStride;
+        if (rows[part] && !native_legacy_fill_pixels((volatile void *)(dst+d),destinationBytes-d,destinationStride,
+            width,rows[part],value)) return 0;
     }
     return 1;
 }

@@ -1,0 +1,7 @@
+# bluetoothd 的两条 text-fixups（native-text-fixup.patch：签名校验之后改页，原字节不吻合就不改）。格式：文件名,偏移,原字节,新字节。
+# 给 make-a830-layout.sh：A830_EXTRA_FIXUPS="$FIX $(grep -v '^#' 这个文件 | tr '\n' ' ')"。$FIX 是 make-stage16.sh 那些脚本已有的 vt-fixups.txt，这两条接在后面，不能替换它。
+# Test/check-pagani-bt-host.py 的 fixups 项对只读根卷核对。
+# F2 sub_1002EF860 -> return 0：不跑 BlueTool，它只认博通芯片，引导由内核做完
+bluetoothd,2ef860,ff8304d1e9230c6d,00008052c0035fd6
+# F3 sub_1000DDAA8 里 strcmp 之后的 CBZ -> NOP：不走 Skywalk 通道，控制套接字上普通 read/write
+bluetoothd,ddd20,a0050034,1f2003d5

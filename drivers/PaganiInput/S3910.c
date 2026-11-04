@@ -234,6 +234,13 @@ int s3910_decode(const uint8_t *p,size_t length,uint16_t max_x,uint16_t max_y,st
     *out=frame; return 0;
 }
 
+unsigned s3910_objects(const uint8_t *p,size_t length) {
+    if (!p || !length || p[0]>S3910_CONTACTS || length!=1u+6u*p[0]) return 0;
+    unsigned objects=0;
+    for (unsigned n=0;n<p[0];++n) if (p[1+n*6+1]) ++objects;
+    return objects;
+}
+
 int s3910_poll(struct s3910 *s,struct s3910_frame *out) {
     if (!s || !out || !s->ready) return -19;
     if (s->version==2) s->command=0x0a;

@@ -35,8 +35,19 @@ static void clock_interval_to_deadline(uint32_t interval, unsigned scale, uint64
 }
 static uint64_t mach_absolute_time() { return callback(4,0,0,nullptr); }
 [[maybe_unused]] static void IODelay(uint32_t us) { callback(5,0,us,nullptr); }
-static void IOLockLock(void *) {}
+// gHost.lock. Commands run one at a time here, so a test only says what the other threads did: gLockHook runs once a thread has the lock, as
+// what happened while it waited; IOLockTryLock fails gLockBusy times, as while a command runs, and keeps the claim it wins.
+static void (*gLockHook)();
+static unsigned gLockBusy;
+static bool gLockClaimed;
+static void lockTaken() { if (gLockHook) { auto hook=gLockHook; gLockHook=nullptr; hook(); } }
+static void IOLockLock(void *) { lockTaken(); }
 static void IOLockUnlock(void *) {}
+[[maybe_unused]] static int IOLockTryLock(void *) {
+  if (gLockBusy) { --gLockBusy; return 0; }
+  if (gLockClaimed) return 0;
+  gLockClaimed=true; lockTaken(); return 1;
+}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
@@ -47,6 +58,7 @@ void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
   gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
+  gLockHook=nullptr; gLockBusy=0; gLockClaimed=false;
 }
 uint8_t *ufs_test_memory() { return memory; }
 bool ufs_test_poisoned() { return gHost.poisoned; }
@@ -60,7 +72,9 @@ uint32_t ufs_test_read(uint8_t lun,uint64_t lba,uint32_t blocks,void *out) { ret
 uint32_t ufs_test_store_open(uint64_t first,uint64_t blocks) { return hostStoreOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_log_open(uint64_t first,uint64_t blocks) { return hostLogOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_write(uint8_t lun,uint64_t lba,uint32_t blocks,const void *src) { return hostWrite4k(lun,lba,blocks,src); }
+uint32_t ufs_test_held_write(uint64_t lba,uint32_t blocks,const void *src) { return hostWrite4kHeld(lba,blocks,src,false,200000); }
 uint32_t ufs_test_sync() { return hostSyncCache(); }
+void ufs_test_log_close() { hostLogClose(); }
 uint32_t ufs_test_nop() {
   return hostNop();
 }

@@ -3,6 +3,9 @@
 #include <assert.h>
 #include <string.h>
 int main(void) {
+    // The dot pitch: the panel's by default, what the boot-arg says, 0 (no value) when it says 0.
+    assert(native_legacy_dot_pitch(0,0)==460 && native_legacy_dot_pitch(0,123)==460);
+    assert(native_legacy_dot_pitch(1,326)==326 && native_legacy_dot_pitch(1,0)==0);
     assert(native_legacy_single_layer_state(1,0,0));
     assert(native_legacy_single_layer_state(0x80000007U,0x80000006U,0xff000000U));
     // Exhaust the four-layer masks: exactly layer zero may remain active.
@@ -105,6 +108,63 @@ int main(void) {
         assert(!native_legacy_copy_pixels(target,sizeof(target),24,source,sizeof(source),24,5,4,3,2));
         assert(!native_legacy_fill_pixels(target,sizeof(target),24,5,4,0,1,UINT32_MAX));
         assert(!memcmp(before,target,sizeof(target)));
+    }
+    for(unsigned offset=0;offset<8;++offset) {
+        // copy_rows (write-combined scanout) must store exactly what copy_pixels stores: padding and tail untouched,
+        // per-row copies unless both strides are packed, and then exactly width*4*height bytes.
+        static const struct {uint64_t dstBytes,dstStride,srcBytes,srcStride;uint32_t width,height;} cases[]={
+            {60,20,51,17,3,3}, // both rows padded
+            {36,12,51,17,3,3}, // packed destination, padded source
+            {60,20,36,12,3,3}, // padded destination, packed source
+            {96,12,72,12,3,4}, // both packed, mappings longer than the picture
+        };
+        unsigned char storage[80];
+        for(unsigned i=0;i<sizeof(storage);++i)storage[i]=(unsigned char)(i*31+7);
+        for(unsigned k=0;k<sizeof(cases)/sizeof(cases[0]);++k) {
+            uint32_t rows[24],pixels[24];
+            memset(rows,0xcc,sizeof(rows));memset(pixels,0xcc,sizeof(pixels));
+            assert(native_legacy_copy_rows(rows,cases[k].dstBytes,cases[k].dstStride,storage+offset,
+                cases[k].srcBytes,cases[k].srcStride,cases[k].width,cases[k].height));
+            assert(native_legacy_copy_pixels(pixels,cases[k].dstBytes,cases[k].dstStride,storage+offset,
+                cases[k].srcBytes,cases[k].srcStride,cases[k].width,cases[k].height));
+            assert(!memcmp(rows,pixels,sizeof(rows)));
+        }
+        uint32_t target[24],before[24];memset(target,0xcc,sizeof(target));memcpy(before,target,sizeof(target));
+        assert(!native_legacy_copy_rows((unsigned char *)target+1,60,20,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(target,63,21,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(target,60,20,storage,50,17,3,3));
+        assert(!native_legacy_copy_rows(target,59,20,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(target,60,20,(const void *)(UINTPTR_MAX-16),51,17,3,3));
+        assert(!memcmp(before,target,sizeof(target)));
+    }
+    {
+        // The GPU status band [y0,y1) is left alone by both copies and the fill; everything else matches a full copy.
+        unsigned char storage[6*17+8];
+        for(unsigned i=0;i<sizeof(storage);++i)storage[i]=(unsigned char)(i*13+5);
+        static const struct {uint32_t y0,y1;} bands[]={{6,6},{0,2},{2,4},{4,6},{1,5},{0,6}};
+        for(unsigned wc=0;wc<2;++wc)for(unsigned k=0;k<sizeof(bands)/sizeof(bands[0]);++k) {
+            uint32_t banded[30],full[30];
+            memset(banded,0xcc,sizeof(banded));memset(full,0xcc,sizeof(full));
+            assert(native_legacy_copy_band(banded,120,20,storage,sizeof(storage),17,3,6,bands[k].y0,bands[k].y1,(int)wc));
+            assert(native_legacy_copy_pixels(full,120,20,storage,sizeof(storage),17,3,6));
+            const unsigned char *b=(const unsigned char *)banded,*f=(const unsigned char *)full;
+            for(unsigned row=0;row<6;++row) {
+                const int kept=row>=bands[k].y0 && row<bands[k].y1;
+                for(unsigned i=0;i<20;++i)assert(b[row*20+i]==(kept || i>=12 ? 0xcc : f[row*20+i]));
+            }
+            memset(banded,0xcc,sizeof(banded));
+            assert(native_legacy_fill_band(banded,120,20,3,6,bands[k].y0,bands[k].y1,0xff000000U));
+            for(unsigned row=0;row<6;++row)for(unsigned column=0;column<5;++column) {
+                const int kept=row>=bands[k].y0 && row<bands[k].y1;
+                assert(banded[row*5+column]==(kept || column>=3 ? 0xccccccccU : 0xff000000U));
+            }
+        }
+        uint32_t target[30];
+        assert(!native_legacy_copy_band(target,120,20,storage,sizeof(storage),17,3,6,4,2,1));
+        assert(!native_legacy_copy_band(target,120,20,storage,sizeof(storage),17,3,6,2,7,0));
+        assert(!native_legacy_copy_band(target,119,20,storage,sizeof(storage),17,3,6,2,4,1));
+        assert(!native_legacy_fill_band(target,120,20,3,6,5,3,0));
+        assert(!native_legacy_fill_band(target,120,20,3,6,0,7,0));
     }
     return 0;
 }

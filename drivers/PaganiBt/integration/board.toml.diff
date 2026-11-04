@@ -1,0 +1,15 @@
+--- a/board.toml	(UniXNU-Pagani_SM8750-gpu)
++++ b/board.toml
+@@ [components]
+-include = [..., "PaganiSpeaker", "PaganiWifi", "PaganiTorch"]
++include = [..., "PaganiSpeaker", "PaganiWifi", "PaganiBt", "PaganiTorch"]
+@@ [kernel] archives
+   # battery and haptics starts. Its firmware is read in place (modem_a) or from the RAM Data seed, never put in the image.
+   "component:PaganiWifi",
++  # The Bluetooth (pagani-bt=N, default off: 1 power-up and handshake, 2 firmware and HCI, 3 LE scan self test), appended to the A830
++  # archive like the others; Stage7Probe calls pagani_bt_start after the Wi-Fi. Its firmware is read in place from bluetooth_a and
++  # modem_a, never put in the image.
++  "component:PaganiBt",
+   # The torch (pagani-torch=1; 2 dry run; default off), appended to the A830 archive like the others; Stage7Probe calls pagani_torch_start
+@@ [payload] kernel_args
+ # 不变：默认镜像里驱动是关的。测试镜像在 A830_EXTRA_ARGS 里加一项（README.md 的轮次清单），命令行只剩 4 字节，要先腾位置。

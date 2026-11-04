@@ -1,0 +1,4 @@
+# Build products and host-test binaries; the vendor GPU firmware never lives in this repository.
+/build/
+/.cache/
+__pycache__/

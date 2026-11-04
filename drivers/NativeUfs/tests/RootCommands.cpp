@@ -110,10 +110,12 @@ static void assertQuarantined()
   assert(ufs_test_poisoned());
   std::array<uint8_t,kDmaBytes> old; memcpy(old.data(),memory,sizeof(memory));
   unsigned oldWrites=writes, oldReleases=releases;
-  uint8_t cdb[6]={}; uint32_t scsi=0, value=0xabcdef;
+  uint8_t cdb[6]={}, block[4096]={}; uint32_t scsi=0, value=0xabcdef;
+  memset(block,0xa5,sizeof(block));
   assert(ufs_test_nop()!=0);
   assert(ufs_test_query(3,2,&value)!=0 && value==0xabcdef);
   assert(ufs_test_scsi(0,cdb,6,false,0,&scsi)!=0);
+  assert(ufs_test_held_write(100,1,block)==kIOReturnNotReady);    // the data area too may still be the controller's
   assert(writes==oldWrites && releases==oldReleases);
   assert(!memcmp(old.data(),memory,sizeof(memory)));
 }
@@ -168,7 +170,10 @@ int main()
   }
   reset();
 #if defined(NATIVE_UFS_READ_ONLY) && NATIVE_UFS_READ_ONLY
-  assert(!ufs_test_store_open(100, 4) && !ufs_test_log_open(200, 4));
+  assert(!ufs_test_store_open(100, 4));
+#if !defined(NATIVE_UFS_LOG_WRITES) || !NATIVE_UFS_LOG_WRITES
+  assert(!ufs_test_log_open(200, 4));
+#endif
   cdb[0]=0x2a;
   assert(hostScsiDir(0,cdb,10,1,4096,200000,&scsi)==kIOReturnBadArgument);
   cdb[0]=0x42; // UNMAP is also prohibited, including a malformed no-data request.

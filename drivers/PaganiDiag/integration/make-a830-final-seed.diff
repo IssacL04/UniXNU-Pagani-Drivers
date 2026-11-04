@@ -1,0 +1,43 @@
+--- a/工具/make-a830-final-seed.sh	2026-10-31 11:44:19
++++ b/工具/make-a830-final-seed.sh	2026-10-31 11:44:19
+@@ -5,22 +5,28 @@
+ #                        plug-in's runtime id changes with its sources and a stale pack means every pipeline compiles on the phone
+ #   s2-audio             + the PaganiAudio plug-in (route repair, Actuator device), its old CDHash out of the owner trust bundle
+ #   s3-full              + the haptics overlays (J120 tunings, MediaExperience tables), keyboard haptics, inline completion off, SOS off
++#   s4-diag              + the PaganiDiag daemon, its CDHash in the owner trust bundle (inert without boot-arg pagani-diag=1)
+ # Usage: make-a830-final-seed.sh            rerun after a plug-in or overlay change; nothing outside build-userspace/a830-inputs/final
+-# Environment: AUDIO_HAL=<dir> (default audio2/out/hal), HAPTICS_OVERLAY=<dir> (default audio2/out/haptics-overlay).
+-# The trust bundle of s3-full is s2-audio's: overlays and preferences are data. The image takes them through A830_PREBUILT_SEED and
+-# A830_OWNER_TRUST (make-a830-layout.sh).
++# Environment: AUDIO_HAL=<dir> (default audio2/out/hal), HAPTICS_OVERLAY=<dir> (default audio2/out/haptics-overlay), DIAG_BUILD=<dir>
++# (default diag/out: UniXNU-Pagani-Drivers drivers/PaganiDiag/scripts/build-paganidiag.py --out).
++# The trust bundle of s3-full is s2-audio's: overlays and preferences are data. The image takes s4-diag and its own bundle through
++# A830_PREBUILT_SEED and A830_OWNER_TRUST (make-a830-layout.sh; A830_DIAG=1 turns the daemon on).
+ set -euo pipefail
+ TOP=/Users/xiaochoumao/unixnu-13t
+ IN=$TOP/build-userspace/a830-inputs
+ F=$IN/final
+ AUDIO_HAL=${AUDIO_HAL:-$IN/audio2/out/hal}
+ HAPTICS_OVERLAY=${HAPTICS_OVERLAY:-$IN/audio2/out/haptics-overlay}
++DIAG_BUILD=${DIAG_BUILD:-$IN/diag/out}
++PD=$TOP/UniXNU-Pagani-Drivers/drivers/PaganiDiag
+ S1=$F/s1b-cache
+ S1_TRUST=$F/s1-metal2-wallpaper-owner-trust.bundle
+ S2=$F/s2-audio
+ S3=$F/s3-full
++S4=$F/s4-diag
+ [ -f "$S1.dbrdisk" ] && [ -f "$S1_TRUST" ] || { echo "no $S1" >&2; exit 1; }
+-rm -f "$S2.dbrdisk" "$S2.json" "$S2-owner-trust.bundle" "$S3.dbrdisk" "$S3.json" "$S3-owner-trust.bundle"
++rm -f "$S2.dbrdisk" "$S2.json" "$S2-owner-trust.bundle" "$S3.dbrdisk" "$S3.json" "$S3-owner-trust.bundle" \
++    "$S4.dbrdisk" "$S4.json" "$S4-owner-trust.bundle"
+ python3 -B "$TOP/UniXNU-Pagani-Drivers/drivers/PaganiAudio/scripts/add-pagani-audio-data.py" --plugin "$AUDIO_HAL" \
+     --trust "$S1_TRUST" --trust-out "$S2-owner-trust.bundle" --replace "$S1.dbrdisk" "$S2.dbrdisk"
+ python3 -B "$TOP/工具/make-phone-seed.py" --disable-jobs "" --haptics-overlay "$HAPTICS_OVERLAY" --keyboard-haptics --keyboard-prefs \
+@@ -32,4 +38,6 @@
+ rm -f "$F/s2b-haptics.dbrdisk" "$F/s2b-haptics.json"
+ python3 -B "$TOP/工具/replace-phone-wallpaper.py" --check "$S3.dbrdisk"
+ python3 -I "$IN/sysfix/keyboard/apply-keyboard-prefs.py" --check "$S3.dbrdisk"
+-ls -la "$S3.dbrdisk" "$S3-owner-trust.bundle"
++python3 -B "$PD/scripts/replace-diag-in-seed.py" --build "$DIAG_BUILD" --trust "$S3-owner-trust.bundle" "$S3.dbrdisk" "$S4.dbrdisk"
++python3 -B "$PD/Test/check-seed.py" "$S4.dbrdisk" "$DIAG_BUILD"
++ls -la "$S4.dbrdisk" "$S4-owner-trust.bundle"

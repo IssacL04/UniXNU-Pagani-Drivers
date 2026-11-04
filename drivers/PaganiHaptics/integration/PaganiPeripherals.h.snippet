@@ -1,0 +1,40 @@
+// UniXNU-Pagani_SM8750(-gpu) package/PaganiPeripherals.h: the board facts PaganiHaptics reads (moved from its PaganiHapticsBoard.h,
+// which is then only the fallback for out-of-tree builds). Source: the PKX110 running device tree, qcom,pmih010x@7/qcom,hv-haptics@f000.
+// SPMI bus 0 (cnfg 0xc42d000, core 0xc400000, chnls 0xc500000, obsrvr 0xc440000), apps EE 0.
+#define PAGANI_HAPTICS_SPMI_CORE     0xc400000ull
+#define PAGANI_HAPTICS_SPMI_CORE_SZ  0x3000u
+#define PAGANI_HAPTICS_SPMI_CNFG     0xc42d000ull
+#define PAGANI_HAPTICS_SPMI_CNFG_SZ  0x4000u
+#define PAGANI_HAPTICS_SPMI_CHNLS    0xc500000ull
+#define PAGANI_HAPTICS_SPMI_OBS      0xc440000ull
+#define PAGANI_HAPTICS_SPMI_EE       0u
+#define PAGANI_HAPTICS_SID           7u
+#define PAGANI_HAPTICS_PID_CFG       0xf0u
+#define PAGANI_HAPTICS_PID_PTN       0xf1u
+#define PAGANI_HAPTICS_PID_HBST      0xf2u
+#define PAGANI_HAPTICS_SDAM_SID      0u
+#define PAGANI_HAPTICS_PID_SDAM      0x9du
+#define PAGANI_HAPTICS_T_LRA_US      5882u
+#define PAGANI_HAPTICS_F0_MIN_DHZ    1600u
+#define PAGANI_HAPTICS_F0_MAX_DHZ    1800u
+#define PAGANI_HAPTICS_VMAX_MV       1260u
+#define PAGANI_HAPTICS_EFFECT_MV     3600u
+#define PAGANI_HAPTICS_FIFO_MV       7450u
+#define PAGANI_HAPTICS_VBAT_LOW_MV   6800u
+#define PAGANI_HAPTICS_VBAT_LOW_SOC  5u
+#define PAGANI_HAPTICS_VBAT_COLD_SOC 20u
+#define PAGANI_HAPTICS_VBAT_COLD_DC  (-50)
+#define PAGANI_HAPTICS_FIFO_THRESH   480u
+#define PAGANI_HAPTICS_BRAKE_MODE    0u
+#define PAGANI_HAPTICS_BRAKE_GAIN    0u
+#define PAGANI_HAPTICS_DRV_SHAPE     1u
+#define PAGANI_HAPTICS_BRAKE_SHAPE   1u
+#define PAGANI_HAPTICS_BRAKE         {0xff, 0x3f, 0x1f, 0, 0, 0, 0, 0}
+#define PAGANI_HAPTICS_BRAKE_LEN     3u
+#define PAGANI_HAPTICS_DRV_DUTY      0x56u
+#define PAGANI_HAPTICS_AUTORES       0x32u
+#define PAGANI_HAPTICS_EFFECT_CYCLES {4, 6, 2, 3, 3, 6, 0, 2, 2, 2, 2, 2, 2, 2, 2}
+#define PAGANI_HAPTICS_EFFECTS       15u
+// After the first dry run (pagani-haptics=2) shows them in "[haptics] id ...", pin the PATTERN and HBOOST identities (0xTTSS):
+// #define PAGANI_HAPTICS_PTN_ID     0x15??
+// #define PAGANI_HAPTICS_HBST_ID    0x15??

@@ -1,0 +1,22 @@
+--- a/drivers/Stage7Probe/Stage7Probe.cpp	2026-10-31 07:30:07
++++ b/drivers/Stage7Probe/Stage7Probe.cpp	2026-10-31 07:30:07
+@@ -42,6 +42,9 @@
+ // The audio service (drivers/PaganiAudio, component PaganiAudio) replaces this default the same way. It reads its own boot argument
+ // pagani-audio and returns at once without it, so it is called unconditionally.
+ extern "C" __attribute__((weak)) void pagani_audio_start(void) {}
++// The vibrator (drivers/PaganiHaptics, appended to the Adreno830 archive) replaces this default the same way. It reads its own boot
++// argument pagani-haptics (absent: off; 2: dry run) and returns at once; its own kernel thread does the rest.
++extern "C" __attribute__((weak)) void pagani_haptics_start(void) {}
+ static IOService *pendingDisplay,*gpuPresenter;
+ static bool displayInitialized,ephemeralState,frameStatus;
+ static uint64_t frames,clients,aksCalls,aksOpens;
+@@ -289,6 +292,9 @@
+     // The audio service: shared rings and a kernel thread only (no hardware with its silent backend); the plug-in finds it once
+     // launchd starts audiomxd.
+     pagani_audio_start();
++    // The vibrator after the audio service (its API is for the audio side) and the battery (its low-battery rule reads the battery's
++    // status); asynchronous, never blocks the display.
++    pagani_haptics_start();
+     OSSafeReleaseNULL(ranges);OSSafeReleaseNULL(memory);OSSafeReleaseNULL(typeData);
+     if(!started) {
+         if(attached)display->detach(nub);

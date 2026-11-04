@@ -1,0 +1,19 @@
+--- a/board.toml	(UniXNU-Pagani_SM8750-gpu)
++++ b/board.toml
+@@ [components]
+-include = [..., "PaganiAdsp", "PaganiAudio", "PaganiBattery"]
++include = [..., "PaganiAdsp", "PaganiAudio", "PaganiBattery", "PaganiHaptics"]
+@@ [kernel] archives
+   # The battery power source (pagani-battery=1, or pagani-adsp=1 without pagani-battery; default off), appended to the A830
+   # archive like PaganiAdsp, so no link setting changes; Stage7Probe calls pagani_battery_start after the GPU and ADSP starts.
+-  "component:PaganiBattery"
++  "component:PaganiBattery",
++  # The vibrator (pagani-haptics=1; 2 dry run; default off), appended to the A830 archive the same way; Stage7Probe calls
++  # pagani_haptics_start after the audio service.
++  "component:PaganiHaptics"
+ ]
+@@ [payload] kernel_args
+ # unchanged: the driver stays off in the default image. Test images add, in this order (one boot each, user present):
+ #   1. --kernel-arg pagani-haptics=2                                (dry run: the log's [haptics] spmi/id/reg lines; nothing written)
+ #   2. --kernel-arg pagani-haptics=1 --kernel-arg pagani-haptics-test=150   (one 150 ms buzz at 1.25 V after the init)
+ #   3. pagani-haptics=1 with the audio side calling the API

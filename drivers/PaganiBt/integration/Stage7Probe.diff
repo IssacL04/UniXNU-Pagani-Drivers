@@ -1,0 +1,21 @@
+--- a/drivers/Stage7Probe/Stage7Probe.cpp
++++ b/drivers/Stage7Probe/Stage7Probe.cpp
+@@ -53,6 +53,9 @@
+ // The Wi-Fi (drivers/PaganiWifi, appended to the Adreno830 archive) replaces this default the same way. It reads its own boot
+ // argument pagani-wifi (absent: off) and returns at once; its own kernel thread does the rest.
+ extern "C" __attribute__((weak)) void pagani_wifi_start(void) {}
++// The Bluetooth (drivers/PaganiBt, appended to the Adreno830 archive) replaces this default the same way. It reads its own boot argument
++// pagani-bt (absent: off) and returns at once; its own kernel thread does the rest and ends.
++extern "C" __attribute__((weak)) void pagani_bt_start(void) {}
+ // The sensors (drivers/PaganiSensors, appended to the Adreno830 archive) replace this default the same way. It reads its own boot argument
+ // pagani-sensors (absent or 0: off, nothing registered) and returns at once; it opens PaganiAdsp IPC router ports, so it comes after
+ // pagani_adsp_start, and its own kernel thread does the rest.
+@@ -338,6 +341,8 @@
+     // The Wi-Fi after the ADSP, battery and haptics starts (its RPMh, QMP and GCC vote uses then follow theirs at boot); asynchronous,
+     // never blocks the display.
+     pagani_wifi_start();
++    // The Bluetooth after the Wi-Fi: both vote the same rails on DRV-2, the same values, never a disable; asynchronous, never blocks the display.
++    pagani_bt_start();
+     // The sensors last: the iOS sensor services (registered before launchd, MobileGestalt asks early) and, with pagani-adsp=1, the
+     // sensor hub's client on PaganiAdsp's IPC router (its registry exists once pagani_adsp_start ran); asynchronous, never blocks.
+     pagani_sensors_start();

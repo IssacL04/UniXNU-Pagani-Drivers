@@ -157,5 +157,35 @@ extern "C" void guest_main() {
   for (unsigned i=0;i<4096;++i) output[i]=0xa5;
   check(hostRead4k(0,0x10000,1,output)!=0,"bad LBA accepted");
   for (unsigned i=0;i<4096;++i) check(output[i]==0xa5,"bad LBA copied stale data");
-  puts("PASS bad-LBA-no-copy\nPASS ALL\n"); finish(0);
+  puts("PASS bad-LBA-no-copy\n");
+#if defined(TEST_LOG_WRITES)
+  // The diagnostic log's commands, as the kernel builds them, against QEMU's own UFS device: WRITE(10) with its RTT and data-out PRDT,
+  // SYNCHRONIZE CACHE(10), the same window checks. The runner compares the disk file afterwards: only the window may have changed.
+  constexpr uint64_t window=64, windowBlocks=66, outside=window+windowBlocks;
+  auto fill=[](unsigned seed,unsigned bytes) { for (unsigned i=0;i<bytes;++i) output[i]=uint8_t((i*7+(i>>9)*13+seed)^0x3c); };
+  check(hostWrite4k(0,window,1,output)==kIOReturnBadArgument && hostSyncCache()==kIOReturnNotReady,"writes before the window opened");
+  check(!hostStoreOpen(window,windowBlocks),"the Data store stays closed");
+  check(hostLogOpen(window,windowBlocks),"log window");
+  fill(1,4096); check(hostWrite4k(0,window,1,output)==0,"WRITE10 4K");
+  fill(2,kDataMax); check(hostWrite4k(0,window+1,32,output)==0,"WRITE10 128K");
+  check(*reinterpret_cast<uint32_t *>(gHost.virt)>>25==9 || *reinterpret_cast<uint32_t *>(gHost.virt)>>25==137,"UTRD data out");
+  fill(3,4096); check(hostWrite4kHeld(window+windowBlocks-1,1,output,false,500000)==0,"WRITE10 held, last block");
+  check(hostSyncCache()==0,"SYNCHRONIZE CACHE");
+  check(hostSyncCacheHeld(500000)==0,"SYNCHRONIZE CACHE held");
+  const uint32_t commands=gRootDiagnostic.command;
+  check(hostWrite4k(0,window-1,1,output)==kIOReturnBadArgument && hostWrite4k(0,outside,1,output)==kIOReturnBadArgument &&
+        hostWrite4k(0,outside-1,2,output)==kIOReturnBadArgument && hostWrite4kHeld(outside,1,output,false,500000)==kIOReturnBadArgument &&
+        hostWrite4kHeld(window,1,output,true,500000)==kIOReturnBadArgument,"writes outside the window");
+  check(gRootDiagnostic.command==commands,"a refused write reached the device");
+  check(hostRead4k(0,window,1,output)==0,"read back 4K");
+  for (unsigned i=0;i<4096;++i) check(output[i]==uint8_t((i*7+(i>>9)*13+1)^0x3c),"written 4K");
+  check(hostRead4k(0,window+1,32,output)==0,"read back 128K");
+  for (unsigned i=0;i<kDataMax;++i) check(output[i]==uint8_t((i*7+(i>>9)*13+2)^0x3c),"written 128K");
+  check(hostRead4k(0,window+windowBlocks-1,1,output)==0,"read back last");
+  for (unsigned i=0;i<4096;++i) check(output[i]==uint8_t((i*7+(i>>9)*13+3)^0x3c),"written last");
+  hostLogClose();
+  check(hostWrite4k(0,window,1,output)==kIOReturnBadArgument,"a write after the close");
+  puts("PASS LOG WRITE\n");
+#endif
+  puts("PASS ALL\n"); finish(0);
 }

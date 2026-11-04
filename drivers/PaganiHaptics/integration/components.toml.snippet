@@ -1,0 +1,19 @@
+# UniXNU/components.toml: after the PaganiBattery entry (revision: the UniXNU-Pagani-Drivers commit that adds drivers/PaganiHaptics)
+[[component]]
+id = "PaganiHaptics"
+kind = "driver"
+function = "OnePlus 13T vibrator: the PMIH010x HAP530 haptics module over SPMI (DIRECT_PLAY, the board's FIFO effects, PCM streaming into the FIFO) with whitelisted, owner-checked writes"
+scope = "community"
+repository = "https://github.com/IssacL04/UniXNU-Pagani-Drivers.git"
+revision = "<commit>"
+path = "drivers/PaganiHaptics"
+hardware = ["OnePlus 13T PKX110", "SM8750", "PMIH010x"]
+os_abi = ["ipados-17.7.11-21H461"]
+board_dependencies = ["Stage7Probe calls pagani_haptics_start", "pagani-haptics=1 (2: dry run; absent: off)", "PaganiPeripherals.h haptics constants (PAGANI_HAPTICS_*)"]
+verified_devices = []
+dependencies = ["Adreno830", "Stage7Probe", "BootProgress"]
+source_files = ["PaganiHaptics.cpp", "HapticsCore.c", "HapticsSpmi.c"]
+runtime_identifiers = ["pagani_haptics_start", "pagani_haptics_status", "pagani_haptics_constant", "pagani_haptics_effect", "pagani_haptics_stream_begin", "pagani_haptics_stream_write", "pagani_haptics_stream_end", "pagani_haptics_stop", "pagani_haptics_info"]
+build_stage = "kernel"
+build = ["{component}/scripts/build-pagani-haptics.py", "--append-to", "{tree}/build/adreno830/libAdreno830.a"]
+outputs = ["build/pagani-haptics/libPaganiHaptics.a"]

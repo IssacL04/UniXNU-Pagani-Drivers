@@ -5,6 +5,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #endif
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
@@ -823,8 +824,9 @@ void NativeUfs::inspectContextBanks (void)
 // block device. The DMA region is ordinary cached, physically contiguous kernel memory with
 // explicit cache maintenance around each command (the stream is mapped through the reserved
 // apps_smmu bypass context bank by smmuBypassStream, so physical addresses are used as-is).
-// Nothing here writes to the storage: only INQUIRY-class and READ(10) commands are built, plus
-// the single START STOP UNIT that wakes the device from the power-down the firmware left.
+// The root path writes nothing to the storage: only INQUIRY-class and READ(10) commands are built, plus
+// the single START STOP UNIT that wakes the device from the power-down the firmware left. The one
+// exception is the diagnostic log window of RootCommands.h (sheng-log=1, NATIVE_UFS_LOG_WRITES=1).
 // ======================================================================================
 namespace {
 #include "RootTransportLayout.h"
@@ -909,6 +911,9 @@ static void hostWrite (unsigned offset, uint32_t value)
 
 #include "RootCommands.h"
 #include "LunDiscovery.h"
+#include "PartitionTable.h"
+#include "NativeUfsPart.h"
+#include "NativeUfsLog.h"
 
 static uint64_t gRootLunLast = UINT32_MAX;
 static char gLunReport[512];
@@ -1038,6 +1043,33 @@ static bool hostBringUp (const char **why)
 }
 }
 
+// ---- Read-only partition access for other drivers (PartitionTable.h) ----------------------------------------------
+// The ABI of UniXNU-sheng's NativeUfs (AdspFirmware.c, WifiProbe.cpp): 1 on success, 0 otherwise. native_ufs_part_status
+// keeps why the last call failed (a UfsPart* code, 0 after a success), for the caller's log. Thread context only.
+static volatile int gPartStatus;
+extern "C" int native_ufs_part_find (const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks)
+{
+  if (!lun || !first || !blocks) { gPartStatus = UfsPartArgument; return 0; }
+  uint8_t *scratch = static_cast<uint8_t *> (IOMallocData (kUfsPartScratch));
+  if (!scratch) { gPartStatus = UfsPartIo; return 0; }
+  UfsPartition found = { 0, 0, 0 };
+  const int rc = ufsPartFind (name, &found, scratch);
+  IOFreeData (scratch, kUfsPartScratch);
+  gPartStatus = rc;
+  if (rc != UfsPartOk) return 0;
+  *lun = found.lun;
+  *first = found.first;
+  *blocks = found.blocks;
+  return 1;
+}
+extern "C" int native_ufs_part_read (uint32_t lun, uint64_t lba, uint32_t blocks, void *dst)
+{
+  const int rc = ufsPartRead (lun, lba, blocks, static_cast<uint8_t *> (dst));
+  gPartStatus = rc;
+  return rc == UfsPartOk;
+}
+extern "C" int native_ufs_part_status (void) { return gPartStatus; }
+
 namespace {
 static uint32_t be32w (const uint8_t *at)
 {
@@ -1065,11 +1097,9 @@ struct StoreGeometry {
 StoreGeometry gStoreGeometry;
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
 // The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
-constexpr uint64_t kLogReserveBlocks = 8192;
 // The log's export region: the 256 MiB just below the log window (the render server's pipeline caches, kits/sheng BootLog.c). It is
-// part of the log's write window, so the store ends below both.
-constexpr uint64_t kExportBlocks = 65536;
-uint64_t gLogRegionFirst, gLogRegionBlocks;
+// part of the log's write window, so the store ends below both. Both sizes and the checks live in LogWindow.h.
+#include "LogWindow.h"
 // The reserve at the end of userdata that the Data store stays clear of: the log and its export region sit inside it (sheng-log=1), the rest
 // is unused. sheng-log-reserve=<MiB>, default 1024; 0 gives all the room to Data and is only accepted with the log off. The store's place
 // depends on it, so an image keeps one value for its whole life (a different value moves the store: the old one is read as blank).
@@ -1163,99 +1193,7 @@ extern "C" int native_ufs_store_sync (void)
   return storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
 }
 
-// ---- Diagnostic log window (sheng-log=1) --------------------------------------------------------------------------
-// The board's log writer (kits/sheng BootLog.c) gets the last kLogReserveBlocks of userdata and the kExportBlocks below them, refused
-// unless the partition holds them clear of the flashed root image plus a 4 MiB guard. Off without the boot argument.
-static unsigned logMode (void)
-{
-  static int cached = -1;
-  if (cached < 0) {
-    uint32_t value = 0;
-    if (!PE_parse_boot_argn ("sheng-log", &value, sizeof (value)) || value > 1) value = 0;
-    cached = static_cast<int> (value);
-  }
-  return static_cast<unsigned> (cached);
-}
-
-// Returns 1 with the window's first absolute LBA and size in 4096-byte blocks, 0 on refusal (reason in *why, may be null).
-extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const char **why)
-{
-  const char *reason = "";
-  int ok = 0;
-  if (!logMode ()) reason = "off";
-  else if (!gStoreGeometry.valid || !gHost.ready) reason = "no root layout";
-  else if (gLogRegionBlocks) reason = "already open";
-  else {
-    uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
-    uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
-    if (reserveBlocks () < kLogReserveBlocks + kExportBlocks) reason = "reserve too small for the log";
-    else if (partition - reserveBlocks () < imageBlocks + 1024) reason = "overlaps the root image";
-    else {
-      uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks;
-      // One write window covers the export region and the log: [first - kExportBlocks, first + kLogReserveBlocks).
-      if (!hostLogOpen (first - kExportBlocks, kExportBlocks + kLogReserveBlocks)) reason = "window refused";
-      else {
-        gLogRegionFirst = first;
-        gLogRegionBlocks = kLogReserveBlocks;
-        if (firstLba) *firstLba = first;
-        if (blocks) *blocks = kLogReserveBlocks;
-        ok = 1;
-      }
-    }
-  }
-  if (why) *why = reason;
-  return ok;
-}
-
-extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *src)
-{
-  if (!gLogRegionBlocks || !src || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;
-  while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, gLogRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
-    src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
-    rel += chunk;
-    blocks -= chunk;
-  }
-  return 1;
-}
-
-// The export region below the log window: its size in blocks once the log is open, else 0; writes at a block offset inside it.
-extern "C" uint64_t native_ufs_export_blocks (void) { return gLogRegionBlocks ? kExportBlocks : 0; }
-
-extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const void *src)
-{
-  if (!gLogRegionBlocks || !src || !blocks || rel >= kExportBlocks || blocks > kExportBlocks - rel) return 0;
-  const uint64_t base = gLogRegionFirst - kExportBlocks;
-  while (blocks) {
-    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, base + rel, chunk, src) != kIOReturnSuccess) return 0;
-    src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
-    rel += chunk;
-    blocks -= chunk;
-  }
-  return 1;
-}
-
-extern "C" int native_ufs_log_sync (void)
-{
-  return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
-}
-
-// Re-read the GPT header and entry array and compare their CRCs with what was recorded at root start. 0 = unchanged.
-extern "C" unsigned native_ufs_store_gpt_check (void)
-{
-  if (!gStoreGeometry.valid || !gHost.ready) return 1;
-  static uint8_t block[4096];
-  if (hostRead4k (0, 1, 1, block) != kIOReturnSuccess) return 2;
-  uint32_t headerBytes = le32 (block + 12);
-  if (headerBytes < 92 || headerBytes > 4096 || rootCrc32 (block, headerBytes, true) != le32 (block + 16) ||
-      le32 (block + 16) != gStoreGeometry.headerCrc) return 3;
-  uint32_t blocks = (gStoreGeometry.entryCount * 128 + 4095) / 4096;
-  static uint8_t entries[4096 * 4];
-  if (blocks > 4 || hostRead4k (0, gStoreGeometry.entriesLba, blocks, entries) != kIOReturnSuccess) return 4;
-  return rootCrc32 (entries, gStoreGeometry.entryCount * 128) == gStoreGeometry.entriesCrc ? 0 : 5;
-}
+#include "LogInterface.h"
 
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
@@ -1494,12 +1432,27 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
 }
 #endif
 
+// On the device, before registerService: IOBlockStorageDriver::handleStart reads it from its provider, and DKIOCISSOLIDSTATE from the
+// parents of the media (of an APFS volume too), which is what picks XNU's 5/15/25 ms I/O throttle periods instead of the disk's 40/85/200
+// (the rest it changes: README).
+static void declareSolidState (IOService *device)
+{
+  OSDictionary *characteristics = OSDictionary::withCapacity (1);
+  OSString *medium = OSString::withCString (kIOPropertyMediumTypeSolidStateKey);
+  if (characteristics && medium && characteristics->setObject (kIOPropertyMediumTypeKey, medium)) {
+    device->setProperty (kIOPropertyDeviceCharacteristicsKey, characteristics);
+  }
+  OSSafeReleaseNULL (medium);
+  OSSafeReleaseNULL (characteristics);
+}
+
 bool NativeUfsBlock::start (IOService *provider)
 {
   if (!bounce || !windowLock || !IOBlockStorageDevice::start (provider)) {
     return false;
   }
   online = true;
+  declareSolidState (this);
   registerService ();
   return true;
 }

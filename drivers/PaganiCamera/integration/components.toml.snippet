@@ -1,0 +1,19 @@
+# UniXNU/components.toml：加在 PaganiBt 条目之后（revision 填带 drivers/PaganiCamera 的 UniXNU-Pagani-Drivers 提交）。主线合入。
+[[component]]
+id = "PaganiCamera"
+kind = "driver"
+function = "OnePlus 13T camera bring-up: clock controllers, the titan GDSC, VRM rails behind a voltage whitelist, TLMM, MCLK0 and CCI0, up to reading the telephoto S5KJN5 ID; and the log service of the H6ISP plug-in's test pattern"
+scope = "community"
+repository = "https://github.com/IssacL04/UniXNU-Pagani-Drivers.git"
+revision = "<commit>"
+path = "drivers/PaganiCamera"
+hardware = ["OnePlus 13T PKX110", "SM8750", "Titan 980 CCI, Samsung S5KJN5 telephoto"]
+os_abi = ["ipados-17.7.11-21H461"]
+board_dependencies = ["Stage7Probe calls pagani_camera_start", "pagani-cam=N (absent: off)"]
+verified_devices = []
+dependencies = ["Adreno830", "Sm8750Platform", "Stage7Probe", "BootProgress"]
+source_files = ["PaganiCamera.cpp", "PaganiCameraIos.cpp", "CamBringup.c", "CamCci.c", "CamPmic.c"]
+runtime_identifiers = ["pagani_camera_start", "pagani_camera_status"]
+build_stage = "kernel"
+build = ["{component}/scripts/build-pagani-camera.py", "--append-to", "{tree}/build/adreno830/libAdreno830.a"]
+outputs = ["build/pagani-camera/libPaganiCamera.a"]

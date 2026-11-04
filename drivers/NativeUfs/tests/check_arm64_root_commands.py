@@ -66,9 +66,17 @@ SECTIONS {
     results=[]
     for name,physical,bad_dma,sharing in [('low',0x40010000,0,2),('high',0x8cb5e9000,0,2),
                                         ('high-inner-shareable',0x8cb5e9000,0,3),
-                                        ('truncated-high',0x8cb5e9000,1,2),('virtual-as-physical',0x8cb5e9000,2,2)]:
+                                        ('truncated-high',0x8cb5e9000,1,2),('virtual-as-physical',0x8cb5e9000,2,2),
+                                        ('log-writes',0x8cb5e9000,0,2)]:
         directory=out/name; directory.mkdir(exist_ok=True)
         compile_command=common+[f'-DTEST_DMA_PHYS={physical:#x}ULL']
+        # The kernel's flags and a disk of its own that may change; every other case runs on the read-only disk.
+        writes=name=='log-writes'
+        if writes:
+            compile_command+=['-DTEST_LOG_WRITES=1','-DNATIVE_UFS_READ_ONLY=1','-DNATIVE_UFS_LOG_WRITES=1']
+        drive=directory/'disk.raw' if writes else out/'disk.raw'
+        if writes:
+            drive.write_bytes(disk)
         compile_command+=[f'-DTEST_BAD_DMA={bad_dma}',f'-DTEST_SHAREABILITY={sharing}']
         compile_command+=['-c',str(source/'RootCommandsArm64.cpp'),'-o',str(directory/'guest.o')]
         subprocess.run(compile_command,check=True)
@@ -80,7 +88,7 @@ SECTIONS {
                  '-object','memory-backend-ram,id=hi,size=256M',
                  '-device','pc-dimm,memdev=hi,addr=0x8c0000000',
                  '-device','ufs,id=ufs0,bus=pcie.0,addr=1.0',
-                 '-drive',f'if=none,id=disk,format=raw,readonly=on,file={out / "disk.raw"}',
+                 '-drive',f'if=none,id=disk,format=raw,readonly={"off" if writes else "on"},file={drive}',
                  '-device','ufs-lu,bus=ufs0,drive=disk,lun=0',
                  '-device',f'loader,file={directory / "guest.elf"},cpu-num=0',
                  '-nodefaults','-display','none','-serial','stdio','-monitor','none','-no-reboot',
@@ -97,6 +105,12 @@ SECTIONS {
         print(name+'\n'+log,flush=True)
         assert result.returncode==0 and 'FAIL' not in log,(name,result.returncode,errors)
         assert ('PASS rejected bad DMA without resubmission' if bad_dma else 'PASS ALL') in log,name
+        if writes:
+            # The file QEMU kept behind the model: the window changed, every other byte did not.
+            after=drive.read_bytes()
+            first,last=64*4096,(64+66)*4096
+            assert 'PASS LOG WRITE' in log and after[first:last]!=bytes(disk[first:last]),name
+            assert after[:first]==bytes(disk[:first]) and after[last:]==bytes(disk[last:]),'a write left the window'
         results.append({'case':name,'dma_pa':hex(physical),'shareability':sharing,'passed':True,
                         'registers':dict(re.findall(r'^(\w+)=(0x[0-9a-f]+)$',log,re.M))})
     files=[production,source/'RootCommandsArm64.cpp',source/'RootCommandsArm64.S',Path(__file__).resolve()]

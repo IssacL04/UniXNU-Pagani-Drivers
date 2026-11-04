@@ -1,0 +1,51 @@
+--- a/工具/make-phone-seed.py	2026-10-31 11:44:19
++++ b/工具/make-phone-seed.py	2026-10-31 11:44:19
+@@ -68,16 +68,14 @@
+                    state 2/6 ("Skipping installation of %@ because it is already uninstalled") and datamigrator removed all 29 staged
+                    apps: one of those passes marked every app hidden (markHiddenAppAsUninstalled:).
+ --diag-daemon DIR  the PaganiDiag daemon (UniXNU-Pagani-Drivers drivers/PaganiDiag, scripts/build-paganidiag.py output DIR):
+-                   DIR/paganidiag to /private/var/ngpu/bin/paganidiag (0755; its CDHash must be DIR/trust.json's, which the image's
+-                   owner trust bundle must carry: scripts/make-diag-trust.py), DIR/paganidiag.conf beside it when present, the
+-                   logging preference DIR/com.apple.migration.plist to /private/var/preferences/Logging/Subsystems (Enable/Persist
+-                   Info: DataMigration logs every SystemAppMigrator line at info level, which the subsystem would not keep), and
+-                   the launchd job DIR/org.unixnu.pagani.diag.plist to /private/var/ngpu/daemons. launchd of 21H461 takes every
+-                   /System/Library job from its signed cache, so that job is not what starts the daemon: the kernel
+-                   (phone-diag-sysctl.patch) runs it in place of the first exec of /usr/libexec/DumpPanic (job
+-                   com.apple.DumpPanic) when the file is there, and the daemon writes its lines through kern.pagani_diag_line.
+-                   The launch policy is not changed (com.apple.bluetoothd and com.apple.iomfb_fdr_loader stay disabled); the
+-                   seed is refused when its policy disables com.apple.DumpPanic.
++                   DIR/paganidiag to /private/var/factory_mount/paganidiag (0755; its CDHash must be DIR/trust.json's, which the
++                   image's owner trust bundle must carry: scripts/make-diag-trust.py) and DIR/paganidiag.conf beside it when
++                   present. launchd of 21H461 takes every /System/Library job from its signed cache, so no job starts the daemon:
++                   with boot-arg pagani-diag=1 the kernel (phone-diag-sysctl.patch) runs it in place of the first exec of
++                   /usr/libexec/DumpPanic (job com.apple.DumpPanic) when the file is there, and the daemon writes its lines through
++                   kern.pagani_diag_line. The directory is the one the Sandbox platform policy lets xpcproxy run a program from
++                   (drivers/PaganiDiag/Test/check-exec-policy.py). The launch policy is not changed; the seed is refused when it
++                   disables com.apple.DumpPanic. A seed that exists already: scripts/replace-diag-in-seed.py.
+ 
+ --wifi-firmware DIR  the peach Wi-Fi firmware pulled from the phone (build-userspace/a830-inputs/wifi/make-wifi-firmware-seed.md)
+                    to /private/var/ngpu/firmware/wlan, its layout kept (peach/amss20.bin, tmel_peach_20.elf, join.txt ...): regular
+@@ -135,10 +133,10 @@
+     'com.apple.VoiceMemos', 'com.apple.weather')
+ KEYBOARD_FIXES = ('com.apple.keyboard:KeyboardDisableHitTesting=true', 'com.apple.keyboard.ContinuousPath:KeyboardContinuousPathEnabled=false')
+ KEYBOARD_INLINE_OFF = 'com.apple.keyboard.preferences:KeyboardInlineCompletion=false'   # --keyboard-prefs unless --keep-inline-completions
+-# PaganiDiag (--diag-daemon): the daemon, its optional configuration, the logging preference and the (unused on 21H461) launchd job.
+-DIAG_FILES = (('paganidiag', 'ngpu/bin/paganidiag', 0o755), ('paganidiag.conf', 'ngpu/bin/paganidiag.conf', 0o644),
+-              ('com.apple.migration.plist', 'preferences/Logging/Subsystems/com.apple.migration.plist', 0o644),
+-              ('org.unixnu.pagani.diag.plist', 'ngpu/daemons/org.unixnu.pagani.diag.plist', 0o644))
++# PaganiDiag (--diag-daemon): the daemon and its optional configuration.
++DIAG_FILES = (('paganidiag', 'factory_mount/paganidiag', 0o755), ('paganidiag.conf', 'factory_mount/paganidiag.conf', 0o644))
++# Its former place, from which xpcproxy may not run it: a base seed's files there are left behind by nothing.
++DIAG_FORMER = ('ngpu/bin/paganidiag', 'ngpu/bin/paganidiag.conf', 'ngpu/daemons/org.unixnu.pagani.diag.plist')
+ DIAG_HOST_JOB = 'com.apple.DumpPanic'      # the kernel starts the daemon in place of this job's program
+ 
+ 
+@@ -162,6 +160,8 @@
+     policy = mount / LAUNCH_POLICY
+     if policy.is_file() and plistlib.loads(policy.read_bytes()).get(DIAG_HOST_JOB) is True:
+         sys.exit(f'--diag-daemon: the seed disables {DIAG_HOST_JOB}, in whose place the kernel starts the daemon')
++    for relative in DIAG_FORMER:
++        (mount / relative).unlink(missing_ok=True)
+     staged = {}
+     for source, relative, mode in files:
+         target = mount / relative
