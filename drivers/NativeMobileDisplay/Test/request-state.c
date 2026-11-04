@@ -126,7 +126,7 @@ int main(void) {
             assert(native_legacy_copy_rows(rows,cases[k].dstBytes,cases[k].dstStride,storage+offset,
                 cases[k].srcBytes,cases[k].srcStride,cases[k].width,cases[k].height));
             assert(native_legacy_copy_pixels(pixels,cases[k].dstBytes,cases[k].dstStride,storage+offset,
-                cases[k].srcBytes,cases[k].srcStride,cases[k].width,cases[k].height));
+                cases[k].srcBytes,cases[k].srcStride,cases[k].width,cases[k].height,0,0));
             assert(!memcmp(rows,pixels,sizeof(rows)));
         }
         uint32_t target[24],before[24];memset(target,0xcc,sizeof(target));memcpy(before,target,sizeof(target));
@@ -146,7 +146,7 @@ int main(void) {
             uint32_t banded[30],full[30];
             memset(banded,0xcc,sizeof(banded));memset(full,0xcc,sizeof(full));
             assert(native_legacy_copy_band(banded,120,20,storage,sizeof(storage),17,3,6,bands[k].y0,bands[k].y1,(int)wc));
-            assert(native_legacy_copy_pixels(full,120,20,storage,sizeof(storage),17,3,6));
+            assert(native_legacy_copy_pixels(full,120,20,storage,sizeof(storage),17,3,6,0,0));
             const unsigned char *b=(const unsigned char *)banded,*f=(const unsigned char *)full;
             for(unsigned row=0;row<6;++row) {
                 const int kept=row>=bands[k].y0 && row<bands[k].y1;

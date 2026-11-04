@@ -870,7 +870,7 @@ public:
             shadowValid=false;
             if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-                source->getLength(),sourceStride,width,height)) {
+                source->getLength(),sourceStride,width,height,0,0)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             stored=length;

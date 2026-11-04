@@ -201,7 +201,7 @@ static inline int native_legacy_copy_band(volatile void *destination,
         if (!(wc ? native_legacy_copy_rows((void *)out,destinationBytes-d,destinationStride,in,sourceBytes-s,
                        sourceStride,width,rows[part])
                  : native_legacy_copy_pixels((volatile void *)out,destinationBytes-d,destinationStride,in,
-                       sourceBytes-s,sourceStride,width,rows[part]))) return 0;
+                       sourceBytes-s,sourceStride,width,rows[part],0,0))) return 0;
     }
     return 1;
 }
@@ -215,7 +215,7 @@ static inline int native_legacy_fill_band(volatile void *destination,
     for (unsigned part=0;part<2;++part) {
         const uint64_t d=(uint64_t)first[part]*destinationStride;
         if (rows[part] && !native_legacy_fill_pixels((volatile void *)(dst+d),destinationBytes-d,destinationStride,
-            width,rows[part],value)) return 0;
+            width,rows[part],value,0,0)) return 0;
     }
     return 1;
 }
