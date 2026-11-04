@@ -80,8 +80,8 @@ static int overlay_off(void) { return __atomic_load_n(&overlay_hidden, __ATOMIC_
 static uint64_t root_sequence, root_value, root_tick, fault_esr, fault_pc, fault_far, fault_psr;
 static int fault_valid;
 char boot_progress_panic_text[2048];
-extern int vsnprintf(char *, size_t, const char *, va_list);
-extern int snprintf(char *, size_t, const char *, ...);
+extern int (vsnprintf)(char *, size_t, const char *, va_list);
+extern int (snprintf)(char *, size_t, const char *, ...);
 static char storage_status[96];
 static char timer_status[96];
 static char display_status[96];
