@@ -9,6 +9,7 @@ typedef u32 __u32;
 #define SOCK_DGRAM 2
 #define MSG_DONTWAIT 0x40
 
+struct sockaddr_unsized;
 struct sockaddr { __kernel_sa_family_t sa_family; char sa_data[14]; };
 struct kvec { void *iov_base; size_t iov_len; };
 struct msghdr { void *msg_name; int msg_namelen; unsigned int msg_flags; };
@@ -22,8 +23,8 @@ struct socket { struct sock *sk; };
 int sock_create_kern(struct net *net, int family, int type, int proto, struct socket **res);
 void sock_release(struct socket *s);
 int kernel_getsockname(struct socket *s, struct sockaddr *addr);
-int kernel_connect(struct socket *s, struct sockaddr *addr, int len, int flags);
-int kernel_bind(struct socket *s, struct sockaddr *addr, int len);
+int kernel_connect(struct socket *s, struct sockaddr_unsized *addr, int len, int flags);
+int kernel_bind(struct socket *s, struct sockaddr_unsized *addr, int len);
 int kernel_sendmsg(struct socket *s, struct msghdr *m, struct kvec *v, size_t n, size_t len);
 int kernel_recvmsg(struct socket *s, struct msghdr *m, struct kvec *v, size_t n, size_t len, int flags);
 #define trace_sk_data_ready(sk) ((void)0)

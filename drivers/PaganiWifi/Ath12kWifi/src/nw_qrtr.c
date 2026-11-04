@@ -156,8 +156,8 @@ void sock_release(struct socket *so) {
 struct qsa { __kernel_sa_family_t family; u32 node, port; };
 int kernel_getsockname(struct socket *so, struct sockaddr *addr) {
   struct qsa *a = (struct qsa *)addr; a->family = AF_QIPCRTR; a->node = LOCAL_NODE; a->port = so->sk->port; return 0; }
-int kernel_bind(struct socket *so, struct sockaddr *addr, int len) { (void)len; so->sk->port = ((struct qsa *)addr)->port; return 0; }
-int kernel_connect(struct socket *so, struct sockaddr *addr, int len, int flags) {
+int kernel_bind(struct socket *so, struct sockaddr_unsized *addr, int len) { (void)len; so->sk->port = ((struct qsa *)addr)->port; return 0; }
+int kernel_connect(struct socket *so, struct sockaddr_unsized *addr, int len, int flags) {
   (void)len; (void)flags; struct qsa *a = (struct qsa *)addr; so->sk->peer_node = a->node; so->sk->peer_port = a->port; so->sk->connected = 1; return 0; }
 int kernel_sendmsg(struct socket *so, struct msghdr *m, struct kvec *v, size_t n, size_t len) {
   if (n != 1) return -EINVAL;
