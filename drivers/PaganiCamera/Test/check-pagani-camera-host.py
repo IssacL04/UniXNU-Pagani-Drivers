@@ -60,7 +60,7 @@ def last_line(text):
 
 def test_pattern(out):
     exe = out / 'pattern'
-    run(['clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', *SANITIZE, SOURCE / 'Test/pattern.m', SOURCE / 'ios/CamPattern.c', '-framework', 'Foundation', '-framework', 'CoreImage',
+    run(['xcrun', '--sdk', 'macosx', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', *SANITIZE, SOURCE / 'Test/pattern.m', SOURCE / 'ios/CamPattern.c', '-framework', 'Foundation', '-framework', 'CoreImage',
          '-framework', 'CoreVideo', '-framework', 'Vision', '-framework', 'CoreGraphics', '-o', exe])
     print(last_line(run([exe])))
 
@@ -69,7 +69,7 @@ def test_provider(out):
     partial = ['-Wno-unused-function', '-Wno-unused-variable']      # 这两种构建只跑一小段
     for name, define in (('provider', []), ('provider-no-vendor', ['-DNO_VENDOR', *partial]), ('provider-no-class', ['-DNO_CLASS', *partial])):
         exe = out / name
-        run(['clang', *OBJC, *define, *(SOURCE / s for s in PROVIDER), *FRAMEWORKS, '-lobjc', '-Wl,-export_dynamic', '-o', exe])
+        run(['xcrun', '--sdk', 'macosx', 'clang', *OBJC, *define, *(SOURCE / s for s in PROVIDER), *FRAMEWORKS, '-lobjc', '-Wl,-export_dynamic', '-o', exe])
         print(last_line(run([exe], timeout=60)))
 
 
