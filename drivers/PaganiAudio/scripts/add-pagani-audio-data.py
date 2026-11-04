@@ -38,8 +38,9 @@ import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-TOP = Path('/Users/xiaochoumao/unixnu-13t')
-sys.path.insert(0, str(TOP / 'UniXNU/drivers/DarwinBoot/Test'))
+TOP = Path(__file__).resolve().parents[4]
+TREE = Path(os.environ.get('UNIXNU_TREE', TOP / 'UniXNU'))
+sys.path.insert(0, str(TREE / 'drivers/DarwinBoot/Test'))
 import packed_ramdisk  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parent
