@@ -5,7 +5,7 @@
 cd "$(dirname "$0")/.." || exit 2
 OUT=${1:-out/sim}
 case "$OUT" in /*) ;; *) OUT=$PWD/$OUT ;; esac
-bash tools/prepare.sh > /dev/null || exit 2
+bash tools/prepare.sh || exit 2
 rm -rf "$OUT"; mkdir -p "$OUT/obj"
 RES=$(clang -print-resource-dir)/include
 CF="-c -nostdinc -isystem shim/libc -isystem $RES -std=gnu11 -w -g -fsanitize=address -fno-omit-frame-pointer -DCONFIG_ATH12K_DEBUG -include lx_pci.h -I shim/include -I include -I out/pinned -I src -I out/ath12k-src"

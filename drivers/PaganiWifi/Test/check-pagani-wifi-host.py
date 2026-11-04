@@ -226,6 +226,7 @@ def test_stack(tmp):
     lines = [line for line in (result.stdout + result.stderr).splitlines() if line.startswith(('PASS', 'FAIL'))]
     print('\n'.join(lines))
     if result.returncode or not lines:
+        print(result.stdout + result.stderr)
         sys.exit(f'FAIL: {module}/tools/peach-sim.sh exit {result.returncode}')
     return 1
 

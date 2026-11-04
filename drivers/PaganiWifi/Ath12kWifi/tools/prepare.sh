@@ -1,6 +1,7 @@
 #!/bin/bash
 # Lays out the generated include trees the sources are built from: out/pinned (public headers used as they are), out/ath12k-src and out/mhi-src
 # (links to the driver sources with the trace points replaced by empty ones).
+set -e
 cd "$(dirname "$0")/.."
 bash tools/pin-headers.sh
 L=$PWD/deps/linux
@@ -27,13 +28,13 @@ PY
 # The refill ring of the receive buffers is the largest user of the endpoint's DMA window; the copy of dp.h makes it 512 buffers instead of 4096.
 # The firmware spreads those buffers over one ring per radio MAC, and the ring of the MAC that receives nothing keeps what it gets: at 2048
 # entries it ends up holding all 512 and the other MAC stops receiving after some hundred frames. At 128 entries it can hold at most a quarter.
-rm -f $O/dp.h; sed -e 's/^#define DP_RXDMA_BUF_RING_SIZE\t\t4096/#define DP_RXDMA_BUF_RING_SIZE\t\t512/' -e 's/^#define DP_RX_MAC_BUF_RING_SIZE\t\t2048/#define DP_RX_MAC_BUF_RING_SIZE\t\t128/' $A/dp.h > $O/dp.h
+rm -f $O/dp.h; sed -e $'s/^#define DP_RXDMA_BUF_RING_SIZE\t\t4096/#define DP_RXDMA_BUF_RING_SIZE\t\t512/' -e $'s/^#define DP_RX_MAC_BUF_RING_SIZE\t\t2048/#define DP_RX_MAC_BUF_RING_SIZE\t\t128/' $A/dp.h > $O/dp.h
 grep -q 'DP_RXDMA_BUF_RING_SIZE.*512' $O/dp.h && grep -q 'DP_RX_MAC_BUF_RING_SIZE.*128' $O/dp.h || { echo "dp.h patch missed" >&2; exit 1; }
 # Sending a command is the condition of the wait in ath12k_wmi_cmd_send: that wait must evaluate it once per round and never after it has succeeded.
 rm -f $O/wmi.c; sed '/^int ath12k_wmi_cmd_send(/,/^}/ s/wait_event_timeout(/wait_event_timeout_once(/' $A/wmi.c > $O/wmi.c
 grep -q 'wait_event_timeout_once' $O/wmi.c || { echo "wmi.c patch missed" >&2; exit 1; }
 # This board has no radio switch on the chip's pin 48: the WCN7850 entry of the copy of wifi7/hw.c names no rfkill pin, so no switch is configured.
-rm -f $O/wifi7/hw.c; sed 's/^\t\t\.rfkill_pin = 48,/\t\t.rfkill_pin = 0,/' $A/wifi7/hw.c > $O/wifi7/hw.c
+rm -f $O/wifi7/hw.c; sed $'s/^\t\t\.rfkill_pin = 48,/\t\t.rfkill_pin = 0,/' $A/wifi7/hw.c > $O/wifi7/hw.c
 grep -q 'rfkill_pin = 48' $O/wifi7/hw.c && { echo "wifi7/hw.c patch missed" >&2; exit 1; }
 # The WCN7850 firmware takes its MLO peer count from the MLO fields of the host capability message and fails an allocation in WMI_INIT
 # when they are missing, so the copy of qmi.c always sends them. That is only about the message: whether this board does MLO stays what
@@ -137,7 +138,7 @@ s = s.replace(mark, mark + '\t\tath12k_dbg_dump(ab, ATH12K_DBG_WMI, NULL, "", sk
 open(p, 'w').write(s)
 PY
 # Without debugfs the firmware's extended statistics are thrown away: the copy of dp_htt.c hands them to nw_htt_ext_stats, which logs them.
-rm -f $O/dp_htt.c; sed 's/^\t\tath12k_debugfs_htt_ext_stats_handler(ab, skb);/\t\t{ extern void nw_htt_ext_stats(struct ath12k_base *, struct sk_buff *); nw_htt_ext_stats(ab, skb); }/' $A/dp_htt.c > $O/dp_htt.c
+rm -f $O/dp_htt.c; sed $'s/^\t\tath12k_debugfs_htt_ext_stats_handler(ab, skb);/\t\t{ extern void nw_htt_ext_stats(struct ath12k_base *, struct sk_buff *); nw_htt_ext_stats(ab, skb); }/' $A/dp_htt.c > $O/dp_htt.c
 grep -q 'nw_htt_ext_stats' $O/dp_htt.c || { echo "dp_htt.c patch missed" >&2; exit 1; }
 ln -sf $L/drivers/bus/mhi/common.h out/common.h
 # The peach entry (PaganiWifi's copy of Ath12kWifi, OnePlus 13T): PCI 0x110e probed as QCC2072 and the peach QMI hooks, each behind a
