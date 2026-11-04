@@ -27,7 +27,6 @@ void pcam_kernel_line(const char *line)
 }
 
 // ---- 替身 ----
-static int gCreateCalls;
 // 21H461 的 CMIOExtensionSessionProvider 有 bundleID 属性（0x21ccf6ed8），mac 的没有：发现会话是 iOS 才有的。
 static id gBundleID;
 static void set_bundle_id(id self, SEL cmd, id value)
@@ -53,7 +52,6 @@ static int default_create(void) {return 1;}
 {
     (void)session;
     self = [super init];
-    gCreateCalls++;
     if (!create && !cmio) {[self release]; return nil;}
     if (!create) {[self release]; return nil;}      // 0x1a693fde0：不在虚拟机里
     _defaultDeviceCreateFunction = create;

@@ -29,7 +29,8 @@
 #include <vector>
 
 static unsigned checks;
-#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } checks++; } while (0)
+static void dumpLog();
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); dumpLog(); abort(); } checks++; } while (0)
 
 static const uint32_t kTable[2][16] = {
     {384000, 556800, 748800, 960000, 1152000, 1363200, 1555200, 1785600, 1996800, 2227200, 2400000, 2745600, 2918400, 3072000, 3321600,
@@ -281,6 +282,7 @@ static void ioPause(void *, uint64_t waited)
 static bool ioAllowed(void *) { return gAllowed; }
 
 static std::vector<std::string> gLog;
+static void dumpLog() { for (const auto &line : gLog) fprintf(stderr, "%s\n", line.c_str()); }
 static void logLine(void *, const char *text) { gLog.push_back(text); }
 static bool logged(const char *part)
 {
