@@ -41,6 +41,7 @@ sys.dont_write_bytecode = True
 TOP = Path(__file__).resolve().parents[4]
 TREE = Path(os.environ.get('UNIXNU_TREE', TOP / 'UniXNU'))
 sys.path.insert(0, str(TREE / 'drivers/DarwinBoot/Test'))
+sys.path.insert(0, str(TREE / 'drivers/PaganiDarwinBoot/Test'))
 import packed_ramdisk  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parent

@@ -19,6 +19,7 @@ directory; the tree is only read) and its reader's barriers. With --kern-exec: t
 proved to apply; with --patch too, the patch file must be what the script makes (a stale patch fails)."""
 import argparse
 import importlib.util
+import os
 import re
 import struct
 import subprocess
@@ -45,6 +46,15 @@ def last_line(text):
 
 
 def check_trust_merge():
+    with tempfile.TemporaryDirectory(prefix='pagani-audio-helper-') as tmp:
+        for component in ('DarwinBoot', 'PaganiDarwinBoot'):
+            tree = Path(tmp) / component
+            helper = tree / 'drivers' / component / 'Test/packed_ramdisk.py'
+            helper.parent.mkdir(parents=True)
+            helper.write_text('')
+            run([sys.executable, '-I', '-c',
+                 'import runpy, sys; ns = runpy.run_path(sys.argv[1]); assert ns["packed_ramdisk"].__file__ == sys.argv[2]',
+                 SOURCE / 'scripts/add-pagani-audio-data.py', helper], env=dict(os.environ, UNIXNU_TREE=str(tree)))
     spec = importlib.util.spec_from_file_location('add_pagani_audio_data', SOURCE / 'scripts/add-pagani-audio-data.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
