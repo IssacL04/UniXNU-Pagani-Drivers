@@ -87,8 +87,18 @@ public:
     std::atomic<unsigned> rung{0};              // doorbells rung: one per message the agent sent
     void ring(uint32_t value) {
         rung++;
-        { std::lock_guard<std::mutex> g(lock); rings_.push_back(value); }
+        std::unique_lock<std::mutex> g(lock);
+        rings_.push_back(value);
         wake_.notify_all();
+        idle_.wait(g, [this] { return rings_.empty() && (!busy_ || lateAt_ > ticks_); });
+    }
+    uint64_t now() { std::lock_guard<std::mutex> g(lock); return ticks_; }
+    // Host scheduling must not consume the simulated transport's timeout budget.
+    void pause() {
+        std::unique_lock<std::mutex> g(lock);
+        ticks_ += 1000000;
+        wake_.notify_all();
+        idle_.wait(g, [this] { return rings_.empty() && (!busy_ || lateAt_ > ticks_); });
     }
     // Replaces the faults, their match counts from zero (under the lock: a late answer may still be in flight).
     void setFaults(const std::vector<Fault> &list) {
@@ -99,7 +109,10 @@ public:
     // Waits until every doorbell so far has been handled (late answers included).
     void settle() {
         std::unique_lock<std::mutex> g(lock);
-        idle_.wait(g, [this] { return rings_.empty() && !busy_; });
+        while (!rings_.empty() || busy_) {
+            if (lateAt_ > ticks_) { ticks_ = lateAt_; wake_.notify_all(); }
+            idle_.wait(g);
+        }
     }
     std::vector<Message> messages() { std::lock_guard<std::mutex> g(lock); return seen; }
     unsigned count(uint32_t protocol, uint32_t message) {
@@ -131,6 +144,7 @@ private:
     std::condition_variable wake_, idle_;
     std::deque<uint32_t> rings_;
     bool quit_ = false, busy_ = false;
+    uint64_t ticks_ = 0, lateAt_ = 0;
     std::vector<unsigned> matched_;
 
     uint32_t rd(uint32_t offset) { return mem[offset / 4].load(std::memory_order_acquire); }
@@ -185,7 +199,14 @@ private:
             }
         }
         if (fault.kind == kSilent) return;                         // never answers: the channel stays busy
-        if (fault.kind == kLate) std::this_thread::sleep_for(std::chrono::milliseconds(fault.lateMs));
+        if (fault.kind == kLate) {
+            std::unique_lock<std::mutex> g(lock);
+            lateAt_ = ticks_ + (uint64_t)fault.lateMs * 1000000;
+            idle_.notify_all();
+            wake_.wait(g, [this] { return quit_ || ticks_ >= lateAt_; });
+            lateAt_ = 0;
+            if (quit_) return;
+        }
         int32_t code = 0;
         std::vector<uint32_t> ret;
         answer(m, &code, &ret, fault);
@@ -258,7 +279,7 @@ private:
     }
 };
 
-// The agent side: the shared memory of the fake, its doorbell, a real clock in nanoseconds.
+// The agent side: the shared memory of the fake, its doorbell and its simulated nanosecond clock.
 static bool gAllowed = true;
 static uint32_t ioRead(void *c, uint32_t offset) { return static_cast<FakeCpucp *>(c)->mem[offset / 4].load(std::memory_order_acquire); }
 static void ioWrite(void *c, uint32_t offset, uint32_t value)
@@ -270,15 +291,8 @@ static void ioRing(void *c, uint32_t value)
     std::atomic_thread_fence(std::memory_order_seq_cst);
     static_cast<FakeCpucp *>(c)->ring(value);
 }
-static uint64_t ioNow(void *)
-{
-    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-static void ioPause(void *, uint64_t waited)
-{
-    if (waited < 100000) std::this_thread::yield();
-    else std::this_thread::sleep_for(std::chrono::microseconds(200));
-}
+static uint64_t ioNow(void *c) { return static_cast<FakeCpucp *>(c)->now(); }
+static void ioPause(void *c, uint64_t) { static_cast<FakeCpucp *>(c)->pause(); }
 static bool ioAllowed(void *) { return gAllowed; }
 
 static std::vector<std::string> gLog;
@@ -511,10 +525,13 @@ static void testFailures()
         cpufreq::Control *c = control(&f);
         CHECK(scmi::ok(scmi::probe(&c->perf)));
         uint32_t index = 0, raw = 0;
+        const uint64_t began = f.now();
         CHECK(scmi::levelGet(&c->perf, 0, &index, &raw).error == scmi::kTimeout);
+        CHECK(f.now() - began > 50 * MS && f.now() - began < 120 * MS);
         CHECK(!(f.mem[scmi::kChannelStatus / 4].load() & scmi::kChannelFree));   // still the platform's
         c->perf.channel.io.timeoutMs = 400;
         CHECK(scmi::ok(scmi::levelGet(&c->perf, 1, &index, &raw)) && index == 4);
+        CHECK(f.now() - began == 120 * MS);
         f.settle();
         const std::vector<Message> m = f.messages();
         CHECK(m.size() >= 2 && m[m.size() - 1].payload == std::vector<uint32_t>({1}) && m[m.size() - 2].payload == std::vector<uint32_t>({0}));
